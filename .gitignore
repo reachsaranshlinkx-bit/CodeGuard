@@ -1,0 +1,33 @@
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Virtual environments
+.venv/
+**/.venv/
+
+# Environment variables and secrets
+.env
+.env.*
+!.env.example
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Linting and type checking
+.ruff_cache/
+.mypy_cache/
+
+# Frontend
+node_modules/
+.next/
+
+# OS files
+.DS_Store
+Thumbs.db
