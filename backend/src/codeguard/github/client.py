@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import math
 import re
 import time
@@ -25,6 +27,7 @@ from codeguard.github.exceptions import (
     GitHubServerError,
 )
 from codeguard.github.schemas import (
+    GitHubFileContent,
     GitHubPullRequest,
     GitHubPullRequestFile,
     GitHubRepository,
@@ -32,6 +35,7 @@ from codeguard.github.schemas import (
 
 GITHUB_API_BASE_URL = "https://api.github.com"
 GITHUB_API_VERSION = "2026-03-10"
+MAX_GITHUB_FILE_SIZE_BYTES = 1_000_000
 
 
 class GitHubClient:
@@ -559,6 +563,116 @@ class GitHubClient:
             ) from exc
 
         return files
+
+    async def get_file_content(
+        self,
+        owner: str,
+        repo: str,
+        path: str,
+        ref: str,
+    ) -> str:
+        """Retrieve and decode a text file at a specific Git reference."""
+
+        owner = owner.strip()
+        repo = repo.strip()
+        ref = ref.strip()
+
+        if not owner or not repo:
+            raise ValueError("Repository owner and name must not be empty.")
+
+        if (
+            any(char in owner + repo for char in ("/", "\\", "?", "#"))
+            or owner in {".", ".."}
+            or repo in {".", ".."}
+        ):
+            raise ValueError("Repository owner and name must be valid path segments.")
+
+        if not path or not path.strip():
+            raise ValueError("File path must not be empty.")
+
+        if (
+            path.startswith("/")
+            or "\\" in path
+            or any(segment in {"", ".", ".."} for segment in path.split("/"))
+        ):
+            raise ValueError("File path must be a safe relative path.")
+
+        if not ref:
+            raise ValueError("Git reference must not be empty.")
+
+        encoded_path = "/".join(quote(segment, safe="") for segment in path.split("/"))
+
+        api_path = (
+            f"/repos/{quote(owner, safe='')}"
+            f"/{quote(repo, safe='')}"
+            f"/contents/{encoded_path}"
+        )
+
+        request_url = f"{GITHUB_API_BASE_URL}{api_path}?ref={quote(ref, safe='')}"
+
+        payload = await self.get_json(
+            api_path,
+            params={"ref": ref},
+        )
+
+        if not isinstance(payload, dict):
+            raise GitHubResponseError(
+                "GitHub file content response must be a JSON object.",
+                status_code=200,
+                request_url=request_url,
+            )
+
+        raw_size = payload.get("size")
+
+        if (
+            isinstance(raw_size, int)
+            and not isinstance(raw_size, bool)
+            and raw_size > MAX_GITHUB_FILE_SIZE_BYTES
+        ):
+            raise GitHubResponseError(
+                "GitHub file exceeds CodeGuard's supported size limit.",
+                status_code=200,
+                request_url=request_url,
+            )
+
+        try:
+            file_content = GitHubFileContent.model_validate(payload)
+        except ValidationError as exc:
+            raise GitHubResponseError(
+                "GitHub file content response did not match the expected schema.",
+                status_code=200,
+                request_url=request_url,
+            ) from exc
+
+        encoded_content = "".join(file_content.content.split())
+
+        try:
+            decoded_content = base64.b64decode(
+                encoded_content,
+                validate=True,
+            )
+        except (binascii.Error, ValueError) as exc:
+            raise GitHubResponseError(
+                "GitHub returned invalid Base64 file content.",
+                status_code=200,
+                request_url=request_url,
+            ) from exc
+
+        if len(decoded_content) != file_content.size:
+            raise GitHubResponseError(
+                "GitHub file content size does not match its metadata.",
+                status_code=200,
+                request_url=request_url,
+            )
+
+        try:
+            return decoded_content.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise GitHubResponseError(
+                "GitHub file content is not valid UTF-8 text.",
+                status_code=200,
+                request_url=request_url,
+            ) from exc
 
     @staticmethod
     def _get_error_message(response: httpx.Response) -> str:
