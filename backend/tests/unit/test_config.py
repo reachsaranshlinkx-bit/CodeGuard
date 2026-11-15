@@ -21,3 +21,27 @@ def test_settings_read_environment_variables(
 
     assert settings.log_level == "DEBUG"
     assert settings.environment == "testing"
+
+
+def test_github_token_defaults_to_none(monkeypatch) -> None:
+    monkeypatch.delenv("CODEGUARD_GITHUB_TOKEN", raising=False)
+
+    settings = Settings(_env_file=None)
+
+    assert settings.github_token is None
+
+
+def test_github_token_is_loaded_as_secret(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv(
+        "CODEGUARD_GITHUB_TOKEN",
+        "test-github-token",
+    )
+
+    settings = Settings(_env_file=None)
+
+    assert settings.github_token is not None
+    assert settings.github_token.get_secret_value() == "test-github-token"
+    assert str(settings.github_token) == "**********"
+    assert "test-github-token" not in repr(settings)
