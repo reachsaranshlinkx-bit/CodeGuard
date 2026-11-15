@@ -1,6 +1,7 @@
 from functools import lru_cache
 from typing import Literal
 
+from pydantic import SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 Environment = Literal[
@@ -29,6 +30,7 @@ class Settings(BaseSettings):
     environment: Environment = "development"
     debug: bool = False
     log_level: LogLevel = "INFO"
+    github_token: SecretStr | None = None
 
     model_config = SettingsConfigDict(
         env_file=".env",
