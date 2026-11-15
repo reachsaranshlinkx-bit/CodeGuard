@@ -91,3 +91,14 @@ class GitHubPullRequestFile(GitHubBaseModel):
 
     patch: str | None = None
     previous_filename: str | None = None
+
+
+class GitHubFileContent(GitHubBaseModel):
+    """A text file retrieved from a GitHub repository at a specific ref."""
+
+    type: Literal["file"]
+    encoding: Literal["base64"]
+    path: str
+    sha: str
+    size: int = Field(ge=0)
+    content: str
