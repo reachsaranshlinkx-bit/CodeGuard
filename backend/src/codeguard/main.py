@@ -1,6 +1,7 @@
 from fastapi import FastAPI
 
 from codeguard.api.v1.health import router as health_router
+from codeguard.api.v1.reviews import router as reviews_router
 from codeguard.core.config import Settings, get_settings
 from codeguard.core.logging_config import configure_logging
 
@@ -20,6 +21,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     )
 
     app.include_router(health_router)
+    app.include_router(reviews_router)
 
     logger.info(
         "application_created",
