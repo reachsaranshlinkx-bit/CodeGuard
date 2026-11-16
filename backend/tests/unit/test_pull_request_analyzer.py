@@ -42,6 +42,7 @@ def make_file(
     additions: int = 2,
     deletions: int = 1,
     previous_filename: str | None = None,
+    patch: str | None = None,
 ) -> GitHubPullRequestFile:
     return GitHubPullRequestFile.model_validate(
         {
@@ -51,6 +52,7 @@ def make_file(
             "deletions": deletions,
             "changes": additions + deletions,
             "previous_filename": previous_filename,
+            "patch": patch,
         }
     )
 
@@ -392,3 +394,220 @@ async def test_unexpected_programming_error_is_not_swallowed() -> None:
         match="unexpected programming error",
     ):
         await analyzer.analyze("octocat", "CodeGuard", 42)
+
+
+@pytest.mark.asyncio
+async def test_includes_findings_on_added_lines() -> None:
+    source = "def process_input(value):\n    return eval(value)\n"
+
+    patch = (
+        "@@ -1,2 +1,2 @@\n"
+        " def process_input(value):\n"
+        "-    return value\n"
+        "+    return eval(value)\n"
+    )
+
+    client = FakeGitHubClient(
+        files=[
+            make_file(
+                "src/auth.py",
+                additions=1,
+                deletions=1,
+                patch=patch,
+            ),
+        ],
+        contents={
+            "src/auth.py": source,
+        },
+    )
+
+    analyzer = PullRequestAnalyzer(github_client=client)
+
+    result = await analyzer.analyze("octocat", "CodeGuard", 42)
+    file_result = result.files[0]
+
+    assert file_result.added_line_numbers == frozenset({2})
+    assert len(file_result.risk_findings) == 1
+    assert len(file_result.changed_line_findings) == 1
+    assert file_result.changed_line_findings[0].lineno == 2
+    assert file_result.line_mapping_error is None
+
+
+@pytest.mark.asyncio
+async def test_excludes_findings_on_unchanged_lines() -> None:
+    source = "def run(command):\n    eval(command)\n    exec(command)\n"
+
+    patch = (
+        "@@ -1,2 +1,3 @@\n def run(command):\n     eval(command)\n+    exec(command)\n"
+    )
+
+    client = FakeGitHubClient(
+        files=[
+            make_file(
+                "src/auth.py",
+                additions=1,
+                deletions=0,
+                patch=patch,
+            ),
+        ],
+        contents={
+            "src/auth.py": source,
+        },
+    )
+
+    analyzer = PullRequestAnalyzer(github_client=client)
+
+    result = await analyzer.analyze("octocat", "CodeGuard", 42)
+    file_result = result.files[0]
+
+    assert {finding.lineno for finding in file_result.risk_findings} == {
+        2,
+        3,
+    }
+
+    assert file_result.added_line_numbers == frozenset({3})
+
+    assert tuple(finding.lineno for finding in file_result.changed_line_findings) == (
+        3,
+    )
+
+
+@pytest.mark.asyncio
+async def test_missing_patch_marks_line_mapping_unavailable() -> None:
+    client = FakeGitHubClient(
+        files=[
+            make_file("src/auth.py"),
+        ],
+        contents={
+            "src/auth.py": ("def process_input(value):\n    return eval(value)\n"),
+        },
+    )
+
+    analyzer = PullRequestAnalyzer(github_client=client)
+
+    result = await analyzer.analyze("octocat", "CodeGuard", 42)
+    file_result = result.files[0]
+
+    assert file_result.ast_result is not None
+    assert len(file_result.risk_findings) == 1
+    assert file_result.added_line_numbers is None
+    assert file_result.changed_line_findings is None
+    assert file_result.line_mapping_error == "patch_unavailable"
+
+
+@pytest.mark.asyncio
+async def test_deletion_only_patch_has_no_added_lines() -> None:
+    source = 'def safe():\n    eval("2 + 2")\n'
+
+    patch = '@@ -1,3 +1,2 @@\n def safe():\n     eval("2 + 2")\n-    unused_call()\n'
+
+    client = FakeGitHubClient(
+        files=[
+            make_file(
+                "src/safe.py",
+                additions=0,
+                deletions=1,
+                patch=patch,
+            ),
+        ],
+        contents={
+            "src/safe.py": source,
+        },
+    )
+
+    analyzer = PullRequestAnalyzer(github_client=client)
+
+    result = await analyzer.analyze("octocat", "CodeGuard", 42)
+    file_result = result.files[0]
+
+    assert file_result.added_line_numbers == frozenset()
+    assert len(file_result.risk_findings) == 1
+    assert file_result.changed_line_findings == ()
+    assert file_result.line_mapping_error is None
+
+
+@pytest.mark.asyncio
+async def test_malformed_patch_does_not_stop_file_analysis() -> None:
+    source = "def process_input(value):\n    return eval(value)\n"
+
+    malformed_patch = "@@ -invalid,2 +1,3 @@\n+    return eval(value)\n"
+
+    client = FakeGitHubClient(
+        files=[
+            make_file(
+                "src/auth.py",
+                patch=malformed_patch,
+            ),
+        ],
+        contents={
+            "src/auth.py": source,
+        },
+    )
+
+    analyzer = PullRequestAnalyzer(github_client=client)
+
+    result = await analyzer.analyze("octocat", "CodeGuard", 42)
+    file_result = result.files[0]
+
+    assert file_result.ast_result is not None
+    assert len(file_result.risk_findings) == 1
+    assert file_result.added_line_numbers is None
+    assert file_result.changed_line_findings is None
+    assert file_result.line_mapping_error is not None
+    assert file_result.line_mapping_error.startswith("ValueError:")
+
+
+@pytest.mark.asyncio
+async def test_patch_without_hunks_marks_mapping_unavailable() -> None:
+    client = FakeGitHubClient(
+        files=[
+            make_file(
+                "src/auth.py",
+                additions=0,
+                deletions=0,
+                patch="Binary files differ",
+            ),
+        ],
+        contents={
+            "src/auth.py": ("def authenticate(value):\n    return eval(value)\n"),
+        },
+    )
+
+    analyzer = PullRequestAnalyzer(github_client=client)
+    result = await analyzer.analyze("octocat", "CodeGuard", 42)
+    file_result = result.files[0]
+
+    assert file_result.ast_result is not None
+    assert len(file_result.risk_findings) == 1
+    assert file_result.added_line_numbers is None
+    assert file_result.changed_line_findings is None
+    assert file_result.line_mapping_error == "patch_has_no_hunks"
+
+
+@pytest.mark.asyncio
+async def test_incomplete_patch_marks_mapping_unavailable() -> None:
+    patch = "@@ -1,1 +1,2 @@\n def authenticate(value):\n+    return eval(value)\n"
+
+    client = FakeGitHubClient(
+        files=[
+            make_file(
+                "src/auth.py",
+                additions=2,
+                deletions=0,
+                patch=patch,
+            ),
+        ],
+        contents={
+            "src/auth.py": ("def authenticate(value):\n    return eval(value)\n"),
+        },
+    )
+
+    analyzer = PullRequestAnalyzer(github_client=client)
+    result = await analyzer.analyze("octocat", "CodeGuard", 42)
+    file_result = result.files[0]
+
+    assert file_result.ast_result is not None
+    assert len(file_result.risk_findings) == 1
+    assert file_result.added_line_numbers is None
+    assert file_result.changed_line_findings is None
+    assert file_result.line_mapping_error == "patch_addition_count_mismatch"

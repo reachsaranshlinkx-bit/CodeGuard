@@ -17,6 +17,10 @@ from codeguard.github.schemas import (
     GitHubPullRequest,
     GitHubPullRequestFile,
 )
+from codeguard.review.changed_lines import parse_added_line_numbers
+from codeguard.review.finding_mapper import (
+    filter_findings_to_added_lines,
+)
 
 
 class GitHubClientProtocol(Protocol):
@@ -57,6 +61,12 @@ class FileAnalysisResult:
     previous_filename: str | None
     ast_result: PythonAnalysisResult | None
     risk_findings: tuple[RiskFinding, ...]
+
+    # Changed-line analysis
+    added_line_numbers: frozenset[int] | None = None
+    changed_line_findings: tuple[RiskFinding, ...] | None = None
+    line_mapping_error: str | None = None
+
     skip_reason: str | None = None
     error: str | None = None
 
@@ -158,7 +168,7 @@ class PullRequestAnalyzer:
         head_sha: str,
         changed_file: GitHubPullRequestFile,
     ) -> FileAnalysisResult:
-        """Analyze one changed file without stopping the whole PR review."""
+        """Analyze a changed file and map findings to added lines."""
 
         filename = changed_file.filename
 
@@ -180,7 +190,7 @@ class PullRequestAnalyzer:
                 skip_reason="unchanged_file",
             )
 
-        # Retrieve source code from the exact PR head commit.
+        # Retrieve source from the exact PR head commit.
         try:
             source = await self._github_client.get_file_content(
                 owner,
@@ -194,7 +204,7 @@ class PullRequestAnalyzer:
                 error=f"{type(exc).__name__}: {exc}",
             )
 
-        # Analyze source code without hiding unexpected programming errors.
+        # Run complete-file analysis.
         try:
             ast_result = self._ast_analyzer.analyze(
                 source,
@@ -212,6 +222,46 @@ class PullRequestAnalyzer:
                 error=f"SyntaxError: {exc.msg}",
             )
 
+        # Preserve full-file findings, even when line mapping
+        # is unavailable.
+        added_line_numbers: frozenset[int] | None
+        changed_line_findings: tuple[RiskFinding, ...] | None
+        line_mapping_error: str | None = None
+
+        patch = changed_file.patch
+
+        if patch is None or not patch.strip():
+            added_line_numbers = None
+            changed_line_findings = None
+            line_mapping_error = "patch_unavailable"
+
+        elif not any(line.startswith("@@ ") for line in patch.splitlines()):
+            added_line_numbers = None
+            changed_line_findings = None
+            line_mapping_error = "patch_has_no_hunks"
+
+        else:
+            try:
+                parsed_line_numbers = parse_added_line_numbers(patch)
+
+                if len(parsed_line_numbers) != changed_file.additions:
+                    added_line_numbers = None
+                    changed_line_findings = None
+                    line_mapping_error = "patch_addition_count_mismatch"
+
+                else:
+                    added_line_numbers = parsed_line_numbers
+
+                    changed_line_findings = filter_findings_to_added_lines(
+                        risk_findings,
+                        added_line_numbers,
+                    )
+
+            except ValueError as exc:
+                added_line_numbers = None
+                changed_line_findings = None
+                line_mapping_error = f"{type(exc).__name__}: {exc}"
+
         return FileAnalysisResult(
             file_path=filename,
             status=changed_file.status,
@@ -221,6 +271,9 @@ class PullRequestAnalyzer:
             previous_filename=changed_file.previous_filename,
             ast_result=ast_result,
             risk_findings=risk_findings,
+            added_line_numbers=added_line_numbers,
+            changed_line_findings=changed_line_findings,
+            line_mapping_error=line_mapping_error,
         )
 
     @staticmethod
