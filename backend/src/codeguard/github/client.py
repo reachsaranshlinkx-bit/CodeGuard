@@ -239,6 +239,7 @@ class GitHubClient:
         expected_path: str,
         pull_number: int,
         current_page: int,
+        resource: str,
     ) -> int | None:
         """Safely extract the next page number from GitHub's Link header."""
 
@@ -261,7 +262,7 @@ class GitHubClient:
             is_expected_path = (
                 parsed_url.path == expected_path
                 or re.fullmatch(
-                    rf"/repositories/\d+/pulls/{pull_number}/files",
+                    rf"/repositories/\d+/pulls/{pull_number}/{re.escape(resource)}",
                     parsed_url.path,
                 )
                 is not None
@@ -396,6 +397,7 @@ class GitHubClient:
                 expected_path=path,
                 pull_number=pull_number,
                 current_page=current_page,
+                resource="files",
             )
 
             if next_page is None:
@@ -406,6 +408,103 @@ class GitHubClient:
         raise GitHubResponseError(
             "Maximum pagination page limit reached. "
             "The returned file list may be incomplete.",
+            status_code=200,
+            request_url=request_url,
+        )
+
+    async def get_all_pull_request_reviews(
+        self,
+        owner: str,
+        repo: str,
+        pull_number: int,
+        *,
+        max_pages: int = 30,
+    ) -> list[dict[str, Any]]:
+        """Retrieve all existing pull request reviews using pagination."""
+
+        owner = owner.strip()
+        repo = repo.strip()
+
+        if not owner or not repo:
+            raise ValueError("Repository owner and name must not be empty.")
+
+        if (
+            any(char in owner + repo for char in ("/", "\\", "?", "#"))
+            or owner in {".", ".."}
+            or repo in {".", ".."}
+        ):
+            raise ValueError("Repository owner and name must be valid path segments.")
+
+        if (
+            isinstance(pull_number, bool)
+            or not isinstance(pull_number, int)
+            or pull_number < 1
+        ):
+            raise ValueError("Pull request number must be a positive integer.")
+
+        if (
+            isinstance(max_pages, bool)
+            or not isinstance(max_pages, int)
+            or not 1 <= max_pages <= 30
+        ):
+            raise ValueError("max_pages must be an integer between 1 and 30.")
+
+        path = (
+            f"/repos/{quote(owner, safe='')}"
+            f"/{quote(repo, safe='')}"
+            f"/pulls/{pull_number}/reviews"
+        )
+
+        reviews: list[dict[str, Any]] = []
+        current_page = 1
+
+        for _ in range(max_pages):
+            request_url = (
+                f"{GITHUB_API_BASE_URL}{path}?per_page=100&page={current_page}"
+            )
+
+            response = await self._get_response(
+                path,
+                params={
+                    "per_page": 100,
+                    "page": current_page,
+                },
+            )
+
+            payload = self._decode_json_response(response)
+
+            if not isinstance(payload, list):
+                raise GitHubResponseError(
+                    "GitHub pull request reviews response must be a JSON array.",
+                    status_code=200,
+                    request_url=request_url,
+                )
+
+            if not all(isinstance(item, dict) for item in payload):
+                raise GitHubResponseError(
+                    "GitHub pull request review items must be JSON objects.",
+                    status_code=200,
+                    request_url=request_url,
+                )
+
+            reviews.extend(payload)
+
+            next_page = self._get_next_page(
+                response.headers.get("Link"),
+                expected_path=path,
+                pull_number=pull_number,
+                current_page=current_page,
+                resource="reviews",
+            )
+
+            if next_page is None:
+                return reviews
+
+            current_page = next_page
+
+        raise GitHubResponseError(
+            "Maximum pagination page limit reached. "
+            "The returned review list may be incomplete.",
             status_code=200,
             request_url=request_url,
         )
@@ -673,6 +772,84 @@ class GitHubClient:
                 status_code=200,
                 request_url=request_url,
             ) from exc
+
+    async def create_pull_request_review(
+        self,
+        owner: str,
+        repo: str,
+        pull_number: int,
+        commit_id: str,
+        body: str,
+        comments: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Create a GitHub pull request review without automatic retries."""
+
+        owner = owner.strip()
+        repo = repo.strip()
+
+        if not owner or not repo:
+            raise ValueError("Repository owner and name must not be empty.")
+
+        if (
+            any(char in owner + repo for char in ("/", "\\", "?", "#"))
+            or owner in {".", ".."}
+            or repo in {".", ".."}
+        ):
+            raise ValueError("Repository owner and name must be valid path segments.")
+
+        if (
+            isinstance(pull_number, bool)
+            or not isinstance(pull_number, int)
+            or pull_number < 1
+        ):
+            raise ValueError("Pull request number must be a positive integer.")
+
+        if not isinstance(commit_id, str) or not commit_id.strip():
+            raise ValueError("Commit ID must not be empty.")
+
+        if not isinstance(body, str):
+            raise ValueError("Review body must be a string.")
+
+        if not isinstance(comments, list) or not all(
+            isinstance(comment, dict) for comment in comments
+        ):
+            raise ValueError("Review comments must be a list of dictionaries.")
+
+        path = (
+            f"/repos/{quote(owner, safe='')}"
+            f"/{quote(repo, safe='')}"
+            f"/pulls/{pull_number}/reviews"
+        )
+
+        payload = {
+            "commit_id": commit_id.strip(),
+            "body": body,
+            "event": "COMMENT",
+            "comments": comments,
+        }
+
+        try:
+            response = await self._client.post(
+                path,
+                json=payload,
+            )
+        except httpx.RequestError as exc:
+            raise GitHubRequestError(
+                f"GitHub request failed: {type(exc).__name__}."
+            ) from exc
+
+        self._raise_for_status(response)
+
+        result = self._decode_json_response(response)
+
+        if not isinstance(result, dict):
+            raise GitHubResponseError(
+                "GitHub pull request review response must be a JSON object.",
+                status_code=response.status_code,
+                request_url=str(response.request.url),
+            )
+
+        return result
 
     @staticmethod
     def _get_error_message(response: httpx.Response) -> str:
