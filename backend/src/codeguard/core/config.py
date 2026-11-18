@@ -30,7 +30,9 @@ class Settings(BaseSettings):
     environment: Environment = "development"
     debug: bool = False
     log_level: LogLevel = "INFO"
+
     github_token: SecretStr | None = None
+    api_key: SecretStr | None = None
 
     model_config = SettingsConfigDict(
         env_file=".env",
