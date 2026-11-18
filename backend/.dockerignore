@@ -1,0 +1,28 @@
+
+# Virtual environments
+.venv/
+**/.venv/
+
+# Environment variables and secrets
+.env
+.env.*
+!.env.example
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Testing
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+tests/
+
+# Temporary GitHub inspection scripts
+check_github_*.py
+security_test_fixture.py
+
+# Git
+.git/
