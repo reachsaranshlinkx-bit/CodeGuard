@@ -4,7 +4,10 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, status
 
-from codeguard.api.dependencies import get_pull_request_analyzer
+from codeguard.api.dependencies import (
+    get_pull_request_analyzer,
+    require_api_key,
+)
 from codeguard.github.exceptions import (
     GitHubAuthenticationError,
     GitHubError,
@@ -30,6 +33,7 @@ router = APIRouter(
 @router.post(
     "/reviews",
     response_model=ReviewResponse,
+    dependencies=[Depends(require_api_key)],
 )
 async def create_review(
     request: ReviewRequest,

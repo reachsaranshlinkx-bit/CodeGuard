@@ -45,3 +45,25 @@ def test_github_token_is_loaded_as_secret(
     assert settings.github_token.get_secret_value() == "test-github-token"
     assert str(settings.github_token) == "**********"
     assert "test-github-token" not in repr(settings)
+
+
+def test_api_key_defaults_to_none(monkeypatch) -> None:
+    monkeypatch.delenv("CODEGUARD_API_KEY", raising=False)
+
+    settings = Settings(_env_file=None)
+
+    assert settings.api_key is None
+
+
+def test_api_key_is_loaded_as_secret(monkeypatch) -> None:
+    monkeypatch.setenv(
+        "CODEGUARD_API_KEY",
+        "test-codeguard-api-key",
+    )
+
+    settings = Settings(_env_file=None)
+
+    assert settings.api_key is not None
+    assert settings.api_key.get_secret_value() == "test-codeguard-api-key"
+    assert str(settings.api_key) == "**********"
+    assert "test-codeguard-api-key" not in repr(settings)

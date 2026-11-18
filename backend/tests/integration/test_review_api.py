@@ -1,5 +1,6 @@
 import pytest
 from fastapi.testclient import TestClient
+from pydantic import SecretStr
 
 from codeguard.analyzers.python_ast import PythonAnalysisResult
 from codeguard.analyzers.python_risk import RiskFinding
@@ -16,6 +17,12 @@ API_PAYLOAD = {
     "owner": "octocat",
     "repo": "CodeGuard",
     "pull_number": 42,
+}
+
+API_KEY = "test-codeguard-api-key-for-integration-tests"
+
+API_HEADERS = {
+    "X-CodeGuard-API-Key": API_KEY,
 }
 
 
@@ -91,7 +98,12 @@ class FakePullRequestAnalyzer:
 def create_test_client(
     analyzer: FakePullRequestAnalyzer,
 ) -> tuple[TestClient, object]:
-    app = create_app(settings=Settings(_env_file=None))
+    app = create_app(
+        settings=Settings(
+            _env_file=None,
+            api_key=SecretStr(API_KEY),
+        )
+    )
 
     app.dependency_overrides[get_pull_request_analyzer] = lambda: analyzer
 
@@ -107,6 +119,7 @@ def test_review_endpoint_returns_structured_report() -> None:
             response = client.post(
                 "/api/v1/reviews",
                 json=API_PAYLOAD,
+                headers=API_HEADERS,
             )
 
         assert response.status_code == 200
@@ -158,6 +171,7 @@ def test_review_endpoint_rejects_invalid_requests(
             response = client.post(
                 "/api/v1/reviews",
                 json=payload,
+                headers=API_HEADERS,
             )
 
         assert response.status_code == 422
@@ -181,6 +195,7 @@ def test_review_endpoint_maps_github_not_found_to_404() -> None:
             response = client.post(
                 "/api/v1/reviews",
                 json=API_PAYLOAD,
+                headers=API_HEADERS,
             )
 
         assert response.status_code == 404

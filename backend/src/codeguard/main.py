@@ -20,6 +20,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         debug=app_settings.debug,
     )
 
+    app.dependency_overrides[get_settings] = lambda: app_settings
+
     app.include_router(health_router)
     app.include_router(reviews_router)
 
