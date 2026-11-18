@@ -1,4 +1,4 @@
-from typing import Self
+from typing import Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -109,3 +109,52 @@ class ReviewResponse(BaseModel):
             raise ValueError("severity_counts must match the actual findings.")
 
         return self
+
+
+class ReviewPublishRequest(ReviewRequest):
+    """Request to generate or publish a GitHub pull request review."""
+
+    publish: bool = Field(default=False, strict=True)
+
+
+class ReviewPublishCommentResponse(BaseModel):
+    """API representation of an inline GitHub review comment."""
+
+    model_config = ConfigDict(
+        extra="forbid",
+        str_strip_whitespace=True,
+    )
+
+    path: str = Field(min_length=1)
+    line: int = Field(gt=0, strict=True)
+    side: Literal["RIGHT"] = "RIGHT"
+    body: str = Field(min_length=1)
+
+
+class ReviewPublishResponse(BaseModel):
+    """Response returned after generating or publishing a review."""
+
+    model_config = ConfigDict(
+        extra="forbid",
+        str_strip_whitespace=True,
+    )
+
+    owner: str = Field(min_length=1)
+    repo: str = Field(min_length=1)
+    pull_number: int = Field(gt=0, strict=True)
+
+    title: str = Field(min_length=1)
+    html_url: str = Field(min_length=1)
+    head_sha: str = Field(min_length=1)
+
+    status: Literal[
+        "dry_run",
+        "skipped",
+        "published",
+        "duplicate",
+    ]
+
+    comment_count: int = Field(ge=0, strict=True)
+    review_body: str = Field(min_length=1)
+
+    comments: tuple[ReviewPublishCommentResponse, ...]

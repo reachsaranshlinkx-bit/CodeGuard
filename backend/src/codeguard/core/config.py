@@ -33,6 +33,7 @@ class Settings(BaseSettings):
 
     github_token: SecretStr | None = None
     api_key: SecretStr | None = None
+    enable_review_publishing: bool = False
 
     model_config = SettingsConfigDict(
         env_file=".env",
