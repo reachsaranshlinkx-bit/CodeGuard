@@ -1,7 +1,7 @@
 from functools import lru_cache
 from typing import Literal
 
-from pydantic import SecretStr
+from pydantic import SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 Environment = Literal[
@@ -42,6 +42,27 @@ class Settings(BaseSettings):
         case_sensitive=False,
         extra="ignore",
     )
+
+    @model_validator(mode="after")
+    def validate_production_settings(self) -> "Settings":
+        """Enforce required configuration in production."""
+
+        if self.environment != "production":
+            return self
+
+        if self.debug:
+            raise ValueError("CODEGUARD_DEBUG must be false in production.")
+
+        required_secrets = {
+            "CODEGUARD_API_KEY": self.api_key,
+            "CODEGUARD_GITHUB_TOKEN": self.github_token,
+        }
+
+        for variable_name, secret in required_secrets.items():
+            if secret is None or not secret.get_secret_value().strip():
+                raise ValueError(f"{variable_name} must be configured in production.")
+
+        return self
 
 
 @lru_cache(maxsize=1)
