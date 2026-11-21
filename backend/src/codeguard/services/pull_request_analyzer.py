@@ -230,9 +230,7 @@ class PullRequestAnalyzer:
 
         patch = changed_file.patch
 
-        if changed_file.additions == 0 and (
-            patch is None or not patch.strip()
-        ):
+        if changed_file.additions == 0 and (patch is None or not patch.strip()):
             added_line_numbers = frozenset()
             changed_line_findings = ()
             line_mapping_error = None
