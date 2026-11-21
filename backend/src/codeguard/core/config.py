@@ -1,4 +1,5 @@
 from functools import lru_cache
+from pathlib import Path
 from typing import Literal
 
 from pydantic import SecretStr, model_validator
@@ -33,7 +34,11 @@ class Settings(BaseSettings):
 
     github_token: SecretStr | None = None
     api_key: SecretStr | None = None
+    webhook_database_path: Path = Path("data/webhook_deliveries.sqlite3")
+    github_webhook_secret: SecretStr | None = None
     enable_review_publishing: bool = False
+    webhook_worker_enabled: bool = False
+    webhook_worker_poll_interval_seconds: int = 1
 
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -46,6 +51,10 @@ class Settings(BaseSettings):
     @model_validator(mode="after")
     def validate_production_settings(self) -> "Settings":
         """Enforce required configuration in production."""
+        if self.webhook_worker_poll_interval_seconds < 1:
+            raise ValueError(
+                "CODEGUARD_WEBHOOK_WORKER_POLL_INTERVAL_SECONDS must be at least 1."
+            )
 
         if self.environment != "production":
             return self
@@ -56,6 +65,7 @@ class Settings(BaseSettings):
         required_secrets = {
             "CODEGUARD_API_KEY": self.api_key,
             "CODEGUARD_GITHUB_TOKEN": self.github_token,
+            "CODEGUARD_GITHUB_WEBHOOK_SECRET": self.github_webhook_secret,
         }
 
         for variable_name, secret in required_secrets.items():

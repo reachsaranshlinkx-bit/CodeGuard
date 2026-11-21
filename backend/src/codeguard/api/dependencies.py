@@ -2,11 +2,16 @@ import secrets
 from collections.abc import AsyncIterator
 from typing import Annotated
 
-from fastapi import Depends, Header, HTTPException, status
+from fastapi import Depends, Header, HTTPException, Request, status
 
 from codeguard.core.config import Settings, get_settings
 from codeguard.github.client import GitHubClient
 from codeguard.services.pull_request_analyzer import PullRequestAnalyzer
+from codeguard.services.webhook_review_processor import (
+    WebhookReviewProcessor,
+)
+from codeguard.webhooks.delivery_store import WebhookDeliveryStore
+from codeguard.webhooks.job_queue import WebhookJobQueue
 
 
 async def get_github_client(
@@ -68,3 +73,60 @@ def require_api_key(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid or missing API key.",
         )
+
+
+def get_webhook_delivery_store(
+    request: Request,
+) -> WebhookDeliveryStore:
+    """Provide the application-scoped webhook delivery store."""
+
+    store = getattr(
+        request.app.state,
+        "webhook_delivery_store",
+        None,
+    )
+
+    if not isinstance(store, WebhookDeliveryStore):
+        raise RuntimeError("Webhook delivery store is not configured.")
+
+    return store
+
+
+def get_webhook_review_processor(
+    analyzer: Annotated[
+        PullRequestAnalyzer,
+        Depends(get_pull_request_analyzer),
+    ],
+    github_client: Annotated[
+        GitHubClient,
+        Depends(get_github_client),
+    ],
+    settings: Annotated[
+        Settings,
+        Depends(get_settings),
+    ],
+) -> WebhookReviewProcessor:
+    """Provide the webhook review processing service."""
+
+    return WebhookReviewProcessor(
+        analyzer=analyzer,
+        github_client=github_client,
+        publishing_enabled=settings.enable_review_publishing,
+    )
+
+
+def get_webhook_job_queue(
+    request: Request,
+) -> WebhookJobQueue:
+    """Provide the application-scoped durable webhook job queue."""
+
+    queue = getattr(
+        request.app.state,
+        "webhook_job_queue",
+        None,
+    )
+
+    if not isinstance(queue, WebhookJobQueue):
+        raise RuntimeError("Webhook job queue is not configured.")
+
+    return queue

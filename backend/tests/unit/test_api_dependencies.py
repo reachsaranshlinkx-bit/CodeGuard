@@ -1,9 +1,13 @@
 import pytest
+from fastapi import FastAPI
 from pydantic import SecretStr
+from starlette.requests import Request
 
 import codeguard.api.dependencies as dependencies
+from codeguard.api.dependencies import get_webhook_job_queue
 from codeguard.core.config import Settings
 from codeguard.services.pull_request_analyzer import PullRequestAnalyzer
+from codeguard.webhooks.job_queue import WebhookJobQueue
 
 
 class FakeGitHubClient:
@@ -97,3 +101,38 @@ def test_analyzer_dependency_uses_provided_github_client() -> None:
 
     assert isinstance(analyzer, PullRequestAnalyzer)
     assert analyzer._github_client is client
+
+
+def test_get_webhook_job_queue_returns_configured_queue(
+    tmp_path,
+) -> None:
+    app = FastAPI()
+    queue = WebhookJobQueue(tmp_path / "jobs.sqlite3")
+
+    app.state.webhook_job_queue = queue
+
+    request = Request(
+        {
+            "type": "http",
+            "app": app,
+        }
+    )
+
+    assert get_webhook_job_queue(request) is queue
+
+
+def test_get_webhook_job_queue_raises_when_not_configured() -> None:
+    app = FastAPI()
+
+    request = Request(
+        {
+            "type": "http",
+            "app": app,
+        }
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="not configured",
+    ):
+        get_webhook_job_queue(request)

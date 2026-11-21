@@ -9,6 +9,11 @@ services:
 
     env_file:
       - ./backend/.env
+    environment:
+      CODEGUARD_WEBHOOK_DATABASE_PATH: /data/webhook_deliveries.sqlite3
+
+    volumes:
+      - codeguard-data:/data
 
     ports:
       - "8000:8000"
@@ -30,3 +35,6 @@ services:
       timeout: 5s
       retries: 3
       start_period: 10s
+
+volumes:
+  codeguard-data:
