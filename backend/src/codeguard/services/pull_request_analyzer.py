@@ -230,7 +230,16 @@ class PullRequestAnalyzer:
 
         patch = changed_file.patch
 
-        if patch is None or not patch.strip():
+        if (
+            changed_file.status == "added"
+            and changed_file.additions == 0
+            and not source.strip()
+        ):
+            added_line_numbers = frozenset()
+            changed_line_findings = ()
+            line_mapping_error = None
+
+        elif patch is None or not patch.strip():
             added_line_numbers = None
             changed_line_findings = None
             line_mapping_error = "patch_unavailable"
