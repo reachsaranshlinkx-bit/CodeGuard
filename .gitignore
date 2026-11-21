@@ -36,3 +36,5 @@ backend/data/
 
 # Temporary GitHub inspection scripts
 backend/check_github_*.py
+# Local runtime SQLite databases
+/data/*.sqlite3*
