@@ -524,6 +524,37 @@ async def test_empty_added_python_file_has_no_changed_lines() -> None:
 
 
 @pytest.mark.asyncio
+async def test_zero_additions_with_missing_patch_has_no_changed_lines() -> None:
+    source = 'def safe():\n    eval("2 + 2")\n'
+
+    client = FakeGitHubClient(
+        files=[
+            make_file(
+                "src/safe.py",
+                status="modified",
+                additions=0,
+                deletions=1,
+                patch=None,
+            ),
+        ],
+        contents={
+            "src/safe.py": source,
+        },
+    )
+
+    analyzer = PullRequestAnalyzer(github_client=client)
+
+    result = await analyzer.analyze("octocat", "CodeGuard", 42)
+    file_result = result.files[0]
+
+    assert file_result.ast_result is not None
+    assert len(file_result.risk_findings) == 1
+    assert file_result.added_line_numbers == frozenset()
+    assert file_result.changed_line_findings == ()
+    assert file_result.line_mapping_error is None
+
+
+@pytest.mark.asyncio
 async def test_deletion_only_patch_has_no_added_lines() -> None:
     source = 'def safe():\n    eval("2 + 2")\n'
 
