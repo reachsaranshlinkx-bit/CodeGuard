@@ -60,6 +60,28 @@ class _LocalBindingCollector(ast.NodeVisitor):
     def visit_ClassDef(self, node: ast.ClassDef) -> None:
         self.names.add(node.name)
 
+    def visit_MatchAs(self, node: ast.MatchAs) -> None:
+        """Collect names captured by match-as patterns."""
+
+        if node.name is not None:
+            self.names.add(node.name)
+
+        self.generic_visit(node)
+
+    def visit_MatchStar(self, node: ast.MatchStar) -> None:
+        """Collect names captured by starred match patterns."""
+
+        if node.name is not None:
+            self.names.add(node.name)
+
+    def visit_MatchMapping(self, node: ast.MatchMapping) -> None:
+        """Collect names captured by mapping rest patterns."""
+
+        if node.rest is not None:
+            self.names.add(node.rest)
+
+        self.generic_visit(node)
+
     def visit_Lambda(self, node: ast.Lambda) -> None:
         # Lambda bodies have their own local scope.
         return

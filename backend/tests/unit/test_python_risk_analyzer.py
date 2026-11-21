@@ -215,3 +215,30 @@ def test_risk_analyzer_detects_aliased_builtin_execution() -> None:
     assert len(findings) == 1
     assert findings[0].rule_id == "PY001"
     assert findings[0].lineno == 2
+
+
+@pytest.mark.parametrize(
+    "pattern",
+    [
+        "case operating_system:",
+        "case [*operating_system]:",
+        'case {"key": _, **operating_system}:',
+    ],
+)
+def test_match_pattern_capture_shadows_imported_module_name(
+    pattern: str,
+) -> None:
+    source = (
+        "import os as operating_system\n"
+        "\n"
+        "def execute(value, command):\n"
+        "    match value:\n"
+        f"        {pattern}\n"
+        "            pass\n"
+        "\n"
+        "    operating_system.system(command)\n"
+    )
+
+    findings = analyze(source)
+
+    assert findings == ()
