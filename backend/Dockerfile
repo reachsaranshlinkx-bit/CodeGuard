@@ -30,7 +30,8 @@ RUN uv sync --frozen --no-dev --no-editable
 # Create a non-root application user
 RUN groupadd --system app && \
     useradd --system --gid app --create-home app && \
-    chown -R app:app /app
+    mkdir -p /data && \
+    chown -R app:app /app /data
 
 USER app
 

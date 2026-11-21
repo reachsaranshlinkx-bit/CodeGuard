@@ -26,3 +26,6 @@ security_test_fixture.py
 
 # Git
 .git/
+
+# Local SQLite database
+data/

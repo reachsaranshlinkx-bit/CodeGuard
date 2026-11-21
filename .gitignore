@@ -1,4 +1,3 @@
-
 # Python
 __pycache__/
 *.py[cod]
@@ -31,3 +30,9 @@ node_modules/
 # OS files
 .DS_Store
 Thumbs.db
+
+# Local SQLite database
+backend/data/
+
+# Temporary GitHub inspection scripts
+backend/check_github_*.py

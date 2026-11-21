@@ -74,6 +74,8 @@ jobs:
           CODEGUARD_GITHUB_TOKEN=ci-dummy-token-not-used
           CODEGUARD_API_KEY=ci-dummy-key-not-used
           CODEGUARD_ENABLE_REVIEW_PUBLISHING=false
+          CODEGUARD_WEBHOOK_WORKER_ENABLED=false
+          CODEGUARD_WEBHOOK_WORKER_POLL_INTERVAL_SECONDS=1
           EOF
 
       - name: Validate Docker Compose
