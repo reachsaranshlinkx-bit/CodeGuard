@@ -43,6 +43,7 @@ class CallInfo:
 
     callee: str
     lineno: int
+    caller_qualified_name: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -113,6 +114,24 @@ class _PythonASTVisitor(ast.NodeVisitor):
 
         return ".".join(parts)
 
+    def _current_function_qualified_name(self) -> str | None:
+        """Return the qualified name of the innermost containing function."""
+
+        function_indexes = [
+            index
+            for index, (scope_type, _) in enumerate(self._scope)
+            if scope_type == "function"
+        ]
+
+        if not function_indexes:
+            return None
+
+        last_function_index = function_indexes[-1]
+
+        return ".".join(
+            scope_name for _, scope_name in self._scope[: last_function_index + 1]
+        )
+
     def visit_ClassDef(self, node: ast.ClassDef) -> None:
         """Extract a class and recursively visit its contents."""
 
@@ -167,10 +186,45 @@ class _PythonASTVisitor(ast.NodeVisitor):
         if is_method and self._class_stack:
             self._class_stack[-1].methods.append(node.name)
 
+        # Definition-time expressions execute in the enclosing scope.
+        for decorator in node.decorator_list:
+            self.visit(decorator)
+
+        for positional_default in node.args.defaults:
+            self.visit(positional_default)
+
+        for keyword_default in node.args.kw_defaults:
+            if keyword_default is not None:
+                self.visit(keyword_default)
+
+        arguments = [
+            *node.args.posonlyargs,
+            *node.args.args,
+            *node.args.kwonlyargs,
+        ]
+
+        if node.args.vararg is not None:
+            arguments.append(node.args.vararg)
+
+        if node.args.kwarg is not None:
+            arguments.append(node.args.kwarg)
+
+        for argument in arguments:
+            if argument.annotation is not None:
+                self.visit(argument.annotation)
+
+        if node.returns is not None:
+            self.visit(node.returns)
+
+        for type_parameter in node.type_params:
+            self.visit(type_parameter)
+
+        # Only the function body belongs to the new function scope.
         self._scope.append(("function", node.name))
 
         try:
-            self.generic_visit(node)
+            for statement in node.body:
+                self.visit(statement)
         finally:
             self._scope.pop()
 
@@ -223,6 +277,7 @@ class _PythonASTVisitor(ast.NodeVisitor):
                 CallInfo(
                     callee=callee,
                     lineno=node.lineno,
+                    caller_qualified_name=self._current_function_qualified_name(),
                 )
             )
 

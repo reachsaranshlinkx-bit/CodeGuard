@@ -173,3 +173,103 @@ def test_analyzer_does_not_execute_repository_code() -> None:
 
     assert result.file_path == "src/untrusted.py"
     assert result.calls[0].callee == "RuntimeError"
+
+
+def test_analyzer_tracks_caller_for_top_level_function_calls() -> None:
+    source = "def process_payment():\n    validate_payment()\n    save_transaction()\n"
+
+    result = PythonASTAnalyzer().analyze(
+        source,
+        file_path="src/payments.py",
+    )
+
+    assert [(call.callee, call.caller_qualified_name) for call in result.calls] == [
+        ("validate_payment", "process_payment"),
+        ("save_transaction", "process_payment"),
+    ]
+
+
+def test_analyzer_tracks_caller_for_class_methods() -> None:
+    source = (
+        "class PaymentService:\n"
+        "    def process(self):\n"
+        "        self.validate()\n"
+        "        self.save()\n"
+    )
+
+    result = PythonASTAnalyzer().analyze(
+        source,
+        file_path="src/payments.py",
+    )
+
+    assert [(call.callee, call.caller_qualified_name) for call in result.calls] == [
+        ("self.validate", "PaymentService.process"),
+        ("self.save", "PaymentService.process"),
+    ]
+
+
+def test_analyzer_tracks_caller_for_nested_functions() -> None:
+    source = (
+        "def outer():\n    def inner():\n        validate_payment()\n\n    inner()\n"
+    )
+
+    result = PythonASTAnalyzer().analyze(
+        source,
+        file_path="src/payments.py",
+    )
+
+    assert [(call.callee, call.caller_qualified_name) for call in result.calls] == [
+        ("validate_payment", "outer.inner"),
+        ("inner", "outer"),
+    ]
+
+
+def test_analyzer_records_no_caller_for_module_level_calls() -> None:
+    source = "initialize_application()\n"
+
+    result = PythonASTAnalyzer().analyze(
+        source,
+        file_path="src/main.py",
+    )
+
+    assert len(result.calls) == 1
+    assert result.calls[0].callee == "initialize_application"
+    assert result.calls[0].caller_qualified_name is None
+
+
+def test_analyzer_tracks_enclosing_caller_for_nested_function_definition() -> None:
+    source = (
+        "def outer():\n"
+        "    @register()\n"
+        "    def inner(value=build_default()):\n"
+        "        execute()\n"
+    )
+
+    result = PythonASTAnalyzer().analyze(
+        source,
+        file_path="src/payments.py",
+    )
+
+    assert [(call.callee, call.caller_qualified_name) for call in result.calls] == [
+        ("register", "outer"),
+        ("build_default", "outer"),
+        ("execute", "outer.inner"),
+    ]
+
+
+def test_analyzer_tracks_enclosing_scope_for_method_defaults() -> None:
+    source = (
+        "class PaymentService:\n"
+        "    def process(self, client=build_client()):\n"
+        "        self.validate()\n"
+    )
+
+    result = PythonASTAnalyzer().analyze(
+        source,
+        file_path="src/payments.py",
+    )
+
+    assert [(call.callee, call.caller_qualified_name) for call in result.calls] == [
+        ("build_client", None),
+        ("self.validate", "PaymentService.process"),
+    ]
