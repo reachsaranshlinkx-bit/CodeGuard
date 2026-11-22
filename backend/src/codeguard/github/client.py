@@ -28,6 +28,7 @@ from codeguard.github.exceptions import (
 )
 from codeguard.github.schemas import (
     GitHubFileContent,
+    GitHubGitCommit,
     GitHubPullRequest,
     GitHubPullRequestFile,
     GitHubRepository,
@@ -90,6 +91,66 @@ class GitHubClient:
             transport=transport,
             follow_redirects=False,
         )
+
+    async def get_git_commit(
+        self,
+        owner: str,
+        repo: str,
+        commit_sha: str,
+    ) -> GitHubGitCommit:
+        """Retrieve and validate a GitHub commit."""
+
+        owner = owner.strip()
+        repo = repo.strip()
+        commit_sha = commit_sha.strip()
+
+        if not owner or not repo:
+            raise ValueError("Repository owner and name must not be empty.")
+
+        if (
+            any(char in owner + repo for char in ("/", "\\", "?", "#"))
+            or owner in {".", ".."}
+            or repo in {".", ".."}
+        ):
+            raise ValueError("Repository owner and name must be valid path segments.")
+
+        if not commit_sha:
+            raise ValueError("Commit SHA must not be empty.")
+
+        if any(char in commit_sha for char in ("/", "\\", "?", "#")):
+            raise ValueError("Commit SHA must be a valid path segment.")
+
+        if commit_sha in {".", ".."}:
+            raise ValueError("Commit SHA must be a valid path segment.")
+
+        encoded_commit_sha = quote(commit_sha, safe="")
+
+        path = (
+            f"/repos/{quote(owner, safe='')}"
+            f"/{quote(repo, safe='')}"
+            f"/git/commits/{encoded_commit_sha}"
+        )
+
+        request_url = f"{GITHUB_API_BASE_URL}{path}"
+
+        payload = await self.get_json(path)
+
+        if not isinstance(payload, dict):
+            raise GitHubResponseError(
+                "GitHub commit response must be a JSON object.",
+                status_code=200,
+                request_url=request_url,
+            )
+
+        try:
+            return GitHubGitCommit.model_validate(payload)
+
+        except ValidationError as exc:
+            raise GitHubResponseError(
+                "GitHub commit response did not match the expected schema.",
+                status_code=200,
+                request_url=request_url,
+            ) from exc
 
     async def __aenter__(self) -> GitHubClient:
         return self
