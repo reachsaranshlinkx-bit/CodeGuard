@@ -102,3 +102,21 @@ class GitHubFileContent(GitHubBaseModel):
     sha: str
     size: int = Field(ge=0)
     content: str
+
+
+class GitHubTreeEntry(GitHubBaseModel):
+    """One file, directory, or submodule in a Git tree."""
+
+    path: str = Field(min_length=1)
+    mode: str = Field(min_length=1)
+    type: Literal["blob", "tree", "commit"]
+    sha: str = Field(min_length=1)
+    size: int | None = Field(default=None, ge=0)
+
+
+class GitHubRepositoryTree(GitHubBaseModel):
+    """Repository tree returned by the GitHub Git Trees API."""
+
+    sha: str = Field(min_length=1)
+    tree: tuple[GitHubTreeEntry, ...]
+    truncated: bool
