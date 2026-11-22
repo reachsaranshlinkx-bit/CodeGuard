@@ -242,3 +242,114 @@ def test_match_pattern_capture_shadows_imported_module_name(
     findings = analyze(source)
 
     assert findings == ()
+
+
+def test_module_level_match_pattern_capture_shadows_imported_module_name() -> None:
+    source = (
+        "import os as operating_system\n"
+        "operating_system.system(before_match)\n"
+        "match value:\n"
+        "    case operating_system:\n"
+        "        pass\n"
+        "operating_system.system(after_match)\n"
+    )
+
+    findings = analyze(source)
+
+    assert [finding.lineno for finding in findings] == [2]
+
+
+def test_class_level_match_pattern_capture_shadows_imported_module_name() -> None:
+    source = (
+        "import os as operating_system\n"
+        "operating_system.system(before_class)\n"
+        "class Worker:\n"
+        "    match value:\n"
+        "        case operating_system:\n"
+        "            pass\n"
+        "    operating_system.system(inside_class)\n"
+        "operating_system.system(after_class)\n"
+    )
+
+    findings = analyze(source)
+
+    assert [finding.lineno for finding in findings] == [2, 8]
+
+
+def test_match_pattern_capture_does_not_leak_into_later_case() -> None:
+    source = (
+        "import os as operating_system\n"
+        "match value:\n"
+        '    case {"module": operating_system}:\n'
+        "        pass\n"
+        "    case _:\n"
+        "        operating_system.system(command)\n"
+    )
+
+    findings = analyze(source)
+
+    assert len(findings) == 1
+    assert findings[0].rule_id == "PY002"
+    assert findings[0].lineno == 6
+
+
+def test_refutable_match_pattern_preserves_possible_import_binding() -> None:
+    source = (
+        "import os as operating_system\n"
+        "match value:\n"
+        '    case {"module": operating_system}:\n'
+        "        pass\n"
+        "operating_system.system(command)\n"
+    )
+
+    findings = analyze(source)
+
+    assert len(findings) == 1
+    assert findings[0].rule_id == "PY002"
+    assert findings[0].lineno == 5
+
+
+def test_match_case_assignment_updates_binding_after_match() -> None:
+    source = (
+        "import os as operating_system\n"
+        "match value:\n"
+        "    case _:\n"
+        "        operating_system = None\n"
+        "operating_system.system(command)\n"
+    )
+
+    findings = analyze(source)
+
+    assert findings == ()
+
+
+def test_match_case_merges_different_import_aliases() -> None:
+    source = (
+        "match value:\n"
+        "    case 1:\n"
+        "        import os as module\n"
+        "    case _:\n"
+        "        import subprocess as module\n"
+        "module.system(command)\n"
+    )
+
+    findings = analyze(source)
+
+    assert [finding.rule_id for finding in findings] == ["PY002"]
+
+
+def test_class_match_preserves_outer_imported_alias() -> None:
+    source = (
+        "import os as module\n"
+        "class Worker:\n"
+        "    match value:\n"
+        "        case 1:\n"
+        "            import subprocess as module\n"
+        "        case _:\n"
+        "            pass\n"
+        "    module.system(command)\n"
+    )
+
+    findings = analyze(source)
+
+    assert [finding.rule_id for finding in findings] == ["PY002"]
