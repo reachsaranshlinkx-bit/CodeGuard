@@ -120,3 +120,17 @@ class GitHubRepositoryTree(GitHubBaseModel):
     sha: str = Field(min_length=1)
     tree: tuple[GitHubTreeEntry, ...]
     truncated: bool
+
+
+class GitHubGitTreeReference(GitHubBaseModel):
+    """Tree reference associated with a Git commit."""
+
+    sha: str = Field(min_length=1)
+    url: AnyHttpUrl
+
+
+class GitHubGitCommit(GitHubBaseModel):
+    """Git commit returned by the GitHub Git Database API."""
+
+    sha: str = Field(min_length=1)
+    tree: GitHubGitTreeReference
