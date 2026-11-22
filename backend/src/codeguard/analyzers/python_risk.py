@@ -3,6 +3,8 @@ from __future__ import annotations
 import ast
 from dataclasses import dataclass, field
 
+_ResolvedBinding = str | frozenset[str] | None
+
 
 @dataclass(frozen=True, slots=True)
 class RiskFinding:
@@ -21,7 +23,7 @@ class _Scope:
     """A lexical scope containing imported aliases and local bindings."""
 
     kind: str
-    bindings: dict[str, str | None] = field(default_factory=dict)
+    bindings: dict[str, _ResolvedBinding] = field(default_factory=dict)
     global_names: set[str] = field(default_factory=set)
     nonlocal_names: set[str] = field(default_factory=set)
 
@@ -159,7 +161,7 @@ class _PythonRiskVisitor(ast.NodeVisitor):
     def _bind_name(
         self,
         name: str,
-        canonical_name: str | None,
+        canonical_name: _ResolvedBinding,
     ) -> None:
         """Bind or shadow a name in the appropriate scope."""
 
@@ -190,7 +192,7 @@ class _PythonRiskVisitor(ast.NodeVisitor):
         elif isinstance(target, ast.Starred):
             self._bind_target(target.value)
 
-    def _resolve_name(self, name: str) -> str | None:
+    def _resolve_name(self, name: str) -> _ResolvedBinding:
         """Resolve an imported name through enclosing lexical scopes."""
 
         for index in range(len(self._scopes) - 1, -1, -1):
@@ -208,7 +210,7 @@ class _PythonRiskVisitor(ast.NodeVisitor):
         # Preserve direct built-in and fully qualified call recognition.
         return name
 
-    def _resolve_expression(self, node: ast.expr) -> str | None:
+    def _resolve_expression(self, node: ast.expr) -> _ResolvedBinding:
         """Resolve names and dotted attributes to canonical names."""
 
         if isinstance(node, ast.Name):
@@ -217,10 +219,25 @@ class _PythonRiskVisitor(ast.NodeVisitor):
         if isinstance(node, ast.Attribute):
             parent = self._resolve_expression(node.value)
 
-            if parent is not None:
+            if isinstance(parent, str):
                 return f"{parent}.{node.attr}"
 
+            if isinstance(parent, frozenset):
+                return frozenset(f"{candidate}.{node.attr}" for candidate in parent)
+
         return None
+
+    @staticmethod
+    def _name_candidates(value: _ResolvedBinding) -> frozenset[str]:
+        """Return all possible canonical names for a resolved binding."""
+
+        if isinstance(value, str):
+            return frozenset({value})
+
+        if isinstance(value, frozenset):
+            return value
+
+        return frozenset()
 
     def _add_finding(
         self,
@@ -269,13 +286,15 @@ class _PythonRiskVisitor(ast.NodeVisitor):
         if loader is None:
             return False
 
-        loader_name = self._resolve_expression(loader)
+        loader_names = self._name_candidates(self._resolve_expression(loader))
 
-        return loader_name in {
+        safe_loaders = {
             "yaml.SafeLoader",
             "yaml.CSafeLoader",
             "yaml.BaseLoader",
         }
+
+        return bool(loader_names) and loader_names.issubset(safe_loaders)
 
     def visit_Import(self, node: ast.Import) -> None:
         """Resolve module imports and their aliases."""
@@ -311,6 +330,149 @@ class _PythonRiskVisitor(ast.NodeVisitor):
 
     def visit_Nonlocal(self, node: ast.Nonlocal) -> None:
         self._scopes[-1].nonlocal_names.update(node.names)
+
+    @staticmethod
+    def _merge_match_scope_bindings(
+        states: list[dict[str, _ResolvedBinding]],
+        fallback_bindings: dict[str, _ResolvedBinding],
+    ) -> dict[str, _ResolvedBinding]:
+        """Conservatively merge bindings from possible match outcomes."""
+
+        missing = object()
+
+        names = set().union(*(state.keys() for state in states))
+        merged: dict[str, _ResolvedBinding] = {}
+
+        for name in names:
+            values = [state.get(name, missing) for state in states]
+
+            canonical_names: set[str] = set()
+            has_unresolved_path = False
+
+            for value in values:
+                if value is missing:
+                    value = fallback_bindings.get(name, name)
+
+                if isinstance(value, str):
+                    canonical_names.add(value)
+
+                elif isinstance(value, frozenset):
+                    canonical_names.update(value)
+
+                elif value is None:
+                    has_unresolved_path = True
+
+            if len(canonical_names) == 1:
+                merged[name] = next(iter(canonical_names))
+
+            elif len(canonical_names) > 1:
+                merged[name] = frozenset(canonical_names)
+
+            elif has_unresolved_path:
+                merged[name] = None
+
+        return merged
+
+    def visit_Match(self, node: ast.Match) -> None:
+        """Analyze match cases independently and merge their scope effects."""
+
+        self.visit(node.subject)
+
+        initial_bindings = [scope.bindings.copy() for scope in self._scopes]
+
+        branch_states: list[list[dict[str, _ResolvedBinding]]] = []
+        has_guaranteed_match = False
+
+        for case in node.cases:
+            # Reset every active scope before analyzing this case.
+            for scope, bindings in zip(
+                self._scopes,
+                initial_bindings,
+                strict=True,
+            ):
+                scope.bindings.clear()
+                scope.bindings.update(bindings)
+
+            self.visit(case.pattern)
+
+            # Collect names captured by this pattern.
+            collector = _LocalBindingCollector()
+            collector.visit(case.pattern)
+
+            for name in collector.get_local_names():
+                self._bind_name(name, None)
+
+            if case.guard is not None:
+                self.visit(case.guard)
+
+            for statement in case.body:
+                self.visit(statement)
+
+            # Preserve all binding changes made by this case.
+            branch_states.append([scope.bindings.copy() for scope in self._scopes])
+
+            # An unguarded irrefutable case guarantees that no
+            # unmatched execution path remains.
+            if case.guard is None and self._is_irrefutable_pattern(case.pattern):
+                has_guaranteed_match = True
+                break
+
+        # When no case is guaranteed to match, preserve the possibility
+        # that all patterns fail and the original bindings remain.
+        if not has_guaranteed_match:
+            branch_states.append(initial_bindings)
+
+        # Merge the possible states independently for every active scope.
+        for scope_index, scope in enumerate(self._scopes):
+            scope_states = [state[scope_index] for state in branch_states]
+
+            names = set().union(*(state.keys() for state in scope_states))
+            fallback_bindings: dict[str, _ResolvedBinding] = {}
+
+            for name in names:
+                fallback: _ResolvedBinding = name
+
+                # Resolve the name through enclosing scopes.
+                for outer_index in range(scope_index - 1, -1, -1):
+                    outer_scope = self._scopes[outer_index]
+
+                    # Class namespaces are not closures for methods.
+                    if outer_scope.kind == "class" and any(
+                        inner.kind == "function"
+                        for inner in self._scopes[outer_index + 1 : scope_index + 1]
+                    ):
+                        continue
+
+                    if name in initial_bindings[outer_index]:
+                        fallback = initial_bindings[outer_index][name]
+                        break
+
+                fallback_bindings[name] = fallback
+
+            merged_bindings = self._merge_match_scope_bindings(
+                scope_states,
+                fallback_bindings,
+            )
+
+            scope.bindings.clear()
+            scope.bindings.update(merged_bindings)
+
+    @staticmethod
+    def _is_irrefutable_pattern(pattern: ast.pattern) -> bool:
+        """Return whether a pattern is guaranteed to match."""
+
+        if isinstance(pattern, ast.MatchAs):
+            return pattern.pattern is None or (
+                _PythonRiskVisitor._is_irrefutable_pattern(pattern.pattern)
+            )
+
+        if isinstance(pattern, ast.MatchOr):
+            return any(
+                _PythonRiskVisitor._is_irrefutable_pattern(item)
+                for item in pattern.patterns
+            )
+
+        return False
 
     def _visit_function_header(
         self,
@@ -379,7 +541,7 @@ class _PythonRiskVisitor(ast.NodeVisitor):
         if node.args.kwarg is not None:
             local_names.add(node.args.kwarg.arg)
 
-        local_scope: dict[str, str | None] = {name: None for name in local_names}
+        local_scope: dict[str, _ResolvedBinding] = {name: None for name in local_names}
 
         self._scopes.append(
             _Scope(
@@ -535,7 +697,7 @@ class _PythonRiskVisitor(ast.NodeVisitor):
         if node.type is not None:
             self.visit(node.type)
 
-        previous_binding: str | None = None
+        previous_binding: _ResolvedBinding = None
         had_previous_binding = False
 
         if node.name is not None:
@@ -594,16 +756,18 @@ class _PythonRiskVisitor(ast.NodeVisitor):
     def visit_Call(self, node: ast.Call) -> None:
         """Inspect calls after resolving imported aliases."""
 
-        callee = self._resolve_expression(node.func)
+        callees = self._name_candidates(self._resolve_expression(node.func))
 
         # PY001: Dynamic code execution.
-        if callee in {
+        dynamic_callees = callees & {
             "eval",
             "exec",
             "builtins.eval",
             "builtins.exec",
-        }:
-            function_name = callee.rsplit(".", maxsplit=1)[-1]
+        }
+
+        if dynamic_callees:
+            function_name = sorted(dynamic_callees)[0].rsplit(".", maxsplit=1)[-1]
 
             self._add_finding(
                 node,
@@ -616,39 +780,34 @@ class _PythonRiskVisitor(ast.NodeVisitor):
             )
 
         # PY002: Potentially unsafe command execution.
-        elif callee == "os.system":
-            self._add_finding(
-                node,
-                rule_id="PY002",
-                message=(
-                    "os.system() executes a shell command. "
-                    "Prefer safer subprocess APIs."
-                ),
-                cwe="CWE-78",
-            )
-
-        elif callee in {
+        subprocess_callees = callees & {
             "subprocess.run",
             "subprocess.call",
             "subprocess.Popen",
             "subprocess.check_call",
             "subprocess.check_output",
-        } and self._has_shell_true(node):
+        }
+
+        if "os.system" in callees or (
+            subprocess_callees and self._has_shell_true(node)
+        ):
             self._add_finding(
                 node,
                 rule_id="PY002",
                 message=(
-                    "Subprocess execution with shell=True can "
-                    "introduce command-injection risks."
+                    "Command execution can introduce command-injection risks. "
+                    "Prefer safer subprocess APIs."
                 ),
                 cwe="CWE-78",
             )
 
         # PY003: Unsafe pickle deserialization.
-        elif callee in {
+        pickle_callees = callees & {
             "pickle.load",
             "pickle.loads",
-        }:
+        }
+
+        if pickle_callees:
             self._add_finding(
                 node,
                 rule_id="PY003",
@@ -660,7 +819,7 @@ class _PythonRiskVisitor(ast.NodeVisitor):
             )
 
         # PY004: Potentially unsafe YAML deserialization.
-        elif callee == "yaml.load" and not self._has_safe_yaml_loader(node):
+        if "yaml.load" in callees and not self._has_safe_yaml_loader(node):
             self._add_finding(
                 node,
                 rule_id="PY004",
