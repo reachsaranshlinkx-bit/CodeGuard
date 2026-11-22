@@ -31,6 +31,7 @@ from codeguard.github.schemas import (
     GitHubPullRequest,
     GitHubPullRequestFile,
     GitHubRepository,
+    GitHubRepositoryTree,
 )
 
 GITHUB_API_BASE_URL = "https://api.github.com"
@@ -536,6 +537,79 @@ class GitHubClient:
         except ValidationError as exc:
             raise GitHubResponseError(
                 "GitHub repository response did not match the expected schema.",
+                status_code=200,
+                request_url=request_url,
+            ) from exc
+
+    async def get_repository_tree(
+        self,
+        owner: str,
+        repo: str,
+        tree_sha: str,
+        *,
+        recursive: bool = True,
+    ) -> GitHubRepositoryTree:
+        """Retrieve and validate a GitHub repository tree."""
+
+        owner = owner.strip()
+        repo = repo.strip()
+        tree_sha = tree_sha.strip()
+
+        if not owner or not repo:
+            raise ValueError("Repository owner and name must not be empty.")
+
+        if (
+            any(char in owner + repo for char in ("/", "\\", "?", "#"))
+            or owner in {".", ".."}
+            or repo in {".", ".."}
+        ):
+            raise ValueError("Repository owner and name must be valid path segments.")
+
+        if not tree_sha:
+            raise ValueError("Tree SHA must not be empty.")
+
+        if any(char in tree_sha for char in ("/", "\\", "?", "#")) or tree_sha in {
+            ".",
+            "..",
+        }:
+            raise ValueError("Tree SHA must be a valid path segment.")
+
+        if not isinstance(recursive, bool):
+            raise ValueError("recursive must be a boolean.")
+
+        encoded_tree_sha = quote(tree_sha, safe="")
+
+        path = (
+            f"/repos/{quote(owner, safe='')}"
+            f"/{quote(repo, safe='')}"
+            f"/git/trees/{encoded_tree_sha}"
+        )
+
+        params: dict[str, str | int] | None = {"recursive": "1"} if recursive else None
+
+        request_url = f"{GITHUB_API_BASE_URL}{path}"
+
+        if recursive:
+            request_url += "?recursive=1"
+
+        payload = await self.get_json(
+            path,
+            params=params,
+        )
+
+        if not isinstance(payload, dict):
+            raise GitHubResponseError(
+                "GitHub repository tree response must be a JSON object.",
+                status_code=200,
+                request_url=request_url,
+            )
+
+        try:
+            return GitHubRepositoryTree.model_validate(payload)
+
+        except ValidationError as exc:
+            raise GitHubResponseError(
+                "GitHub repository tree response did not match the expected schema.",
                 status_code=200,
                 request_url=request_url,
             ) from exc
