@@ -4,6 +4,7 @@ from codeguard.analyzers.python_ast import PythonASTAnalyzer
 from codeguard.context.file_discovery import DiscoveredPythonFile
 from codeguard.context.symbols import (
     FileSymbolIndex,
+    RepositoryFileFailure,
     RepositorySymbolIndex,
 )
 
@@ -109,3 +110,31 @@ def test_repository_symbol_index_rejects_duplicate_file_paths() -> None:
             commit_sha="a" * 40,
             files=(file_index, file_index),
         )
+
+
+def test_repository_symbol_index_preserves_file_failures() -> None:
+    failure = RepositoryFileFailure(
+        file_path="src/payments.py",
+        stage="retrieval",
+        error_type="GitHubResponseError",
+        message="File retrieval failed",
+    )
+
+    result = RepositorySymbolIndex(
+        commit_sha="a" * 40,
+        files=(),
+        failures=(failure,),
+    )
+
+    assert result.failures == (failure,)
+    assert result.is_complete is False
+
+
+def test_repository_symbol_index_accepts_complete_result_without_failures() -> None:
+    result = RepositorySymbolIndex(
+        commit_sha="a" * 40,
+        files=(make_file_symbol_index(),),
+    )
+
+    assert result.failures == ()
+    assert result.is_complete is True

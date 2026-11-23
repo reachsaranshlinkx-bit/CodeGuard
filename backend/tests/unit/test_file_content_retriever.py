@@ -3,6 +3,7 @@ import asyncio
 import pytest
 
 from codeguard.context.file_content_retriever import (
+    FileContentRetrievalResult,
     RepositoryFileContentRetriever,
     RetrievedPythonFile,
 )
@@ -10,6 +11,7 @@ from codeguard.context.file_discovery import (
     DiscoveredPythonFile,
     RepositoryFileDiscoveryResult,
 )
+from codeguard.context.symbols import RepositoryFileFailure
 
 COMMIT_SHA = "a" * 40
 
@@ -260,4 +262,129 @@ async def test_retriever_cancels_remaining_requests_after_failure() -> None:
         )
 
     # No in-flight retrieval should remain after failure.
+    assert client.active_requests == 0
+
+
+async def test_retriever_partial_preserves_successes_and_records_failures() -> None:
+    files = (
+        make_discovered_file("src/payments.py"),
+        make_discovered_file("src/orders.py"),
+        make_discovered_file("src/users.py"),
+    )
+
+    client = FakeGitHubClient(
+        {
+            "src/payments.py": "def process_payment(): pass",
+            "src/orders.py": "def create_order(): pass",
+            "src/users.py": "def create_user(): pass",
+        },
+        fail_path="src/orders.py",
+    )
+
+    retriever = RepositoryFileContentRetriever(client)
+
+    result = await retriever.retrieve_partial(
+        owner="octocat",
+        repo="CodeGuard",
+        commit_sha=COMMIT_SHA,
+        discovery=make_discovery(files),
+    )
+
+    assert isinstance(result, FileContentRetrievalResult)
+
+    assert [item.discovered_file.path for item in result.retrieved_files] == [
+        "src/payments.py",
+        "src/users.py",
+    ]
+
+    assert result.failures == (
+        RepositoryFileFailure(
+            file_path="src/orders.py",
+            stage="retrieval",
+            error_type="RuntimeError",
+            message="Failed to retrieve src/orders.py",
+        ),
+    )
+
+    assert result.is_complete is False
+
+
+async def test_retriever_partial_handles_all_files_failing() -> None:
+    files = (
+        make_discovered_file("src/payments.py"),
+        make_discovered_file("src/orders.py"),
+    )
+
+    client = FakeGitHubClient({})
+
+    retriever = RepositoryFileContentRetriever(client)
+
+    result = await retriever.retrieve_partial(
+        owner="octocat",
+        repo="CodeGuard",
+        commit_sha=COMMIT_SHA,
+        discovery=make_discovery(files),
+    )
+
+    assert result.retrieved_files == ()
+    assert len(result.failures) == 2
+    assert all(failure.stage == "retrieval" for failure in result.failures)
+    assert result.is_complete is False
+
+
+async def test_retriever_partial_handles_empty_discovery() -> None:
+    client = FakeGitHubClient({})
+
+    retriever = RepositoryFileContentRetriever(client)
+
+    result = await retriever.retrieve_partial(
+        owner="octocat",
+        repo="CodeGuard",
+        commit_sha=COMMIT_SHA,
+        discovery=make_discovery(()),
+    )
+
+    assert result.retrieved_files == ()
+    assert result.failures == ()
+    assert result.is_complete is True
+    assert client.calls == []
+
+
+async def test_retriever_partial_propagates_cancellation() -> None:
+    files = (
+        make_discovered_file("src/payments.py"),
+        make_discovered_file("src/orders.py"),
+    )
+
+    client = FakeGitHubClient(
+        {
+            "src/payments.py": "print('payment')",
+            "src/orders.py": "print('order')",
+        },
+        delays={
+            "src/payments.py": 30,
+            "src/orders.py": 30,
+        },
+    )
+
+    retriever = RepositoryFileContentRetriever(
+        client,
+        max_concurrency=2,
+    )
+
+    retrieval_task = asyncio.create_task(
+        retriever.retrieve_partial(
+            owner="octocat",
+            repo="CodeGuard",
+            commit_sha=COMMIT_SHA,
+            discovery=make_discovery(files),
+        )
+    )
+
+    await asyncio.sleep(0.01)
+    retrieval_task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await retrieval_task
+
     assert client.active_requests == 0

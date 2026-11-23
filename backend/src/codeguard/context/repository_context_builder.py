@@ -6,7 +6,11 @@ from codeguard.context.file_content_retriever import (
 from codeguard.context.file_discovery import RepositoryFileDiscovery
 from codeguard.context.file_indexer import FileSymbolIndexer
 from codeguard.context.repository_indexer import RepositorySymbolIndexer
-from codeguard.context.symbols import RepositorySymbolIndex
+from codeguard.context.symbols import (
+    FileSymbolIndex,
+    RepositoryFileFailure,
+    RepositorySymbolIndex,
+)
 from codeguard.github.schemas import (
     GitHubGitCommit,
     GitHubRepositoryTree,
@@ -79,7 +83,7 @@ class RepositoryContextBuilder:
         repo: str,
         commit_sha: str,
     ) -> RepositorySymbolIndex:
-        """Build a symbol index for a specific GitHub commit."""
+        """Build a repository index while preserving file-level failures."""
 
         # 1. Resolve the requested commit.
         commit = await self._github_client.get_git_commit(
@@ -99,26 +103,43 @@ class RepositoryContextBuilder:
         # 3. Discover eligible Python files.
         discovery = self._file_discovery.discover(repository_tree)
 
-        # 4. Retrieve discovered files at the exact resolved commit.
-        retrieved_files = await self._file_content_retriever.retrieve(
+        # 4. Retrieve files independently, preserving successful results.
+        retrieval_result = await self._file_content_retriever.retrieve_partial(
             owner=owner,
             repo=repo,
             commit_sha=commit.sha,
             discovery=discovery,
         )
 
-        # 5. Build an AST symbol index for each retrieved file.
-        file_indexes = tuple(
-            self._file_indexer.index(
-                retrieved_file.discovered_file,
-                retrieved_file.source,
-            )
-            for retrieved_file in retrieved_files
-        )
+        file_indexes: list[FileSymbolIndex] = []
+        failures: list[RepositoryFileFailure] = list(retrieval_result.failures)
 
-        # 6. Combine individual indexes into one repository index.
+        # 5. Analyze each successfully retrieved file independently.
+        for retrieved_file in retrieval_result.retrieved_files:
+            discovered_file = retrieved_file.discovered_file
+
+            try:
+                file_index = self._file_indexer.index(
+                    discovered_file,
+                    retrieved_file.source,
+                )
+            except SyntaxError as exc:
+                failures.append(
+                    RepositoryFileFailure(
+                        file_path=discovered_file.path,
+                        stage="analysis",
+                        error_type=type(exc).__name__,
+                        message=str(exc),
+                    )
+                )
+                continue
+
+            file_indexes.append(file_index)
+
+        # 6. Combine successful indexes and all file failures.
         return self._repository_indexer.index(
             commit_sha=commit.sha,
             discovery=discovery,
-            file_indexes=file_indexes,
+            file_indexes=tuple(file_indexes),
+            failures=tuple(failures),
         )

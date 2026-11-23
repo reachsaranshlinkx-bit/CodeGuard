@@ -1,7 +1,20 @@
 from dataclasses import dataclass
+from typing import Literal
 
 from codeguard.analyzers.python_ast import PythonAnalysisResult
 from codeguard.context.file_discovery import DiscoveredPythonFile
+
+FailureStage = Literal["retrieval", "analysis"]
+
+
+@dataclass(frozen=True, slots=True)
+class RepositoryFileFailure:
+    """Failure encountered while processing a repository file."""
+
+    file_path: str
+    stage: FailureStage
+    error_type: str
+    message: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -26,6 +39,7 @@ class RepositorySymbolIndex:
     files: tuple[FileSymbolIndex, ...]
     tree_truncated: bool = False
     file_limit_reached: bool = False
+    failures: tuple[RepositoryFileFailure, ...] = ()
 
     def __post_init__(self) -> None:
         """Validate repository identity and file uniqueness."""
@@ -38,8 +52,26 @@ class RepositorySymbolIndex:
         if len(file_paths) != len(set(file_paths)):
             raise ValueError("Repository symbol index contains duplicate file paths.")
 
+        failure_paths = tuple(failure.file_path for failure in self.failures)
+
+        if len(failure_paths) != len(set(failure_paths)):
+            raise ValueError(
+                "Repository symbol index contains duplicate file failures."
+            )
+
+        overlapping_paths = set(file_paths) & set(failure_paths)
+
+        if overlapping_paths:
+            raise ValueError(
+                "A file cannot have both a successful index and a failure."
+            )
+
     @property
     def is_complete(self) -> bool:
-        """Indicate whether the repository symbol index is complete."""
+        """Indicate whether every discovered file was successfully indexed."""
 
-        return not self.tree_truncated and not self.file_limit_reached
+        return (
+            not self.tree_truncated
+            and not self.file_limit_reached
+            and not self.failures
+        )
