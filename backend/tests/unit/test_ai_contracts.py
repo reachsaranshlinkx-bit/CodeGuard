@@ -1,7 +1,11 @@
 import pytest
 from pydantic import ValidationError
 
-from codeguard.ai.contracts import AIFindingCandidate, AIReviewResult
+from codeguard.ai.contracts import (
+    AIFindingCandidate,
+    AIReviewInput,
+    AIReviewResult,
+)
 
 
 def make_candidate_payload() -> dict[str, object]:
@@ -106,3 +110,49 @@ def test_ai_review_result_rejects_more_than_fifty_findings() -> None:
             summary="Review completed.",
             findings=(candidate,) * 51,
         )
+
+
+def make_review_input_payload() -> dict[str, object]:
+    return {
+        "owner": "octocat",
+        "repo": "CodeGuard",
+        "pull_number": 42,
+        "head_sha": "abc123",
+        "context": "Changed authentication function and related callers.",
+    }
+
+
+def test_ai_review_input_accepts_valid_data() -> None:
+
+    review_input = AIReviewInput.model_validate(make_review_input_payload())
+
+    assert review_input.owner == "octocat"
+    assert review_input.repo == "CodeGuard"
+    assert review_input.pull_number == 42
+
+
+def test_ai_review_input_rejects_invalid_pull_number() -> None:
+
+    payload = make_review_input_payload()
+    payload["pull_number"] = 0
+
+    with pytest.raises(ValidationError):
+        AIReviewInput.model_validate(payload)
+
+
+def test_ai_review_input_rejects_empty_context() -> None:
+
+    payload = make_review_input_payload()
+    payload["context"] = "   "
+
+    with pytest.raises(ValidationError):
+        AIReviewInput.model_validate(payload)
+
+
+def test_ai_review_input_rejects_oversized_context() -> None:
+
+    payload = make_review_input_payload()
+    payload["context"] = "x" * 50_001
+
+    with pytest.raises(ValidationError):
+        AIReviewInput.model_validate(payload)
