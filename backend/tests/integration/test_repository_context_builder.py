@@ -1,6 +1,7 @@
 import pytest
 
 from codeguard.context.repository_context_builder import RepositoryContextBuilder
+from codeguard.context.symbols import RepositoryFileFailure
 from codeguard.github.schemas import GitHubGitCommit, GitHubRepositoryTree
 
 COMMIT_SHA = "a" * 40
@@ -280,18 +281,79 @@ async def test_repository_context_builder_propagates_tree_error() -> None:
     assert client.file_requests == []
 
 
-async def test_repository_context_builder_propagates_file_error() -> None:
-    client = FakeGitHubClient(
-        make_repository_tree(("src/payments.py",)),
-        {"src/payments.py": "def process_payment(): pass\n"},
+async def test_builder_keeps_success_when_file_retrieval_fails() -> None:
+    tree = make_repository_tree(
+        (
+            "src/payments.py",
+            "src/orders.py",
+        )
     )
-    client.file_error_path = "src/payments.py"
+
+    client = FakeGitHubClient(
+        tree,
+        {
+            "src/payments.py": "def process_payment(): pass\n",
+            "src/orders.py": "def create_order(): pass\n",
+        },
+    )
+    client.file_error_path = "src/orders.py"
 
     builder = RepositoryContextBuilder(client)
 
-    with pytest.raises(RuntimeError, match="src/payments.py"):
-        await builder.build(
-            owner="octocat",
-            repo="CodeGuard",
-            commit_sha=COMMIT_SHA,
+    result = await builder.build(
+        owner="octocat",
+        repo="CodeGuard",
+        commit_sha=COMMIT_SHA,
+    )
+
+    assert len(result.files) == 1
+    assert result.files[0].discovered_file.path == "src/payments.py"
+
+    assert result.failures == (
+        RepositoryFileFailure(
+            file_path="src/orders.py",
+            stage="retrieval",
+            error_type="RuntimeError",
+            message="Failed to retrieve src/orders.py",
+        ),
+    )
+
+    assert result.is_complete is False
+
+
+async def test_builder_keeps_valid_files_when_syntax_is_invalid() -> None:
+    tree = make_repository_tree(
+        (
+            "src/payments.py",
+            "src/orders.py",
         )
+    )
+
+    client = FakeGitHubClient(
+        tree,
+        {
+            "src/payments.py": "def process_payment(): pass\n",
+            "src/orders.py": "def broken(:\n    pass\n",
+        },
+    )
+
+    builder = RepositoryContextBuilder(client)
+
+    result = await builder.build(
+        owner="octocat",
+        repo="CodeGuard",
+        commit_sha=COMMIT_SHA,
+    )
+
+    assert len(result.files) == 1
+    assert result.files[0].discovered_file.path == "src/payments.py"
+
+    assert len(result.failures) == 1
+
+    failure = result.failures[0]
+
+    assert failure.file_path == "src/orders.py"
+    assert failure.stage == "analysis"
+    assert failure.error_type == "SyntaxError"
+    assert failure.message
+    assert result.is_complete is False

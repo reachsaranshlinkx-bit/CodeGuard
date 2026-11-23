@@ -6,7 +6,36 @@ from codeguard.context.file_discovery import (
 )
 from codeguard.context.file_indexer import FileSymbolIndexer
 from codeguard.context.repository_indexer import RepositorySymbolIndexer
-from codeguard.context.symbols import FileSymbolIndex
+from codeguard.context.symbols import (
+    FileSymbolIndex,
+    RepositoryFileFailure,
+)
+
+
+def test_repository_indexer_accepts_failure_for_missing_file_index() -> None:
+    payment_file = make_discovered_file("src/payments.py")
+    order_file = make_discovered_file("src/orders.py", "c")
+
+    discovery = make_discovery_result((payment_file, order_file))
+
+    failure = RepositoryFileFailure(
+        file_path="src/orders.py",
+        stage="retrieval",
+        error_type="RuntimeError",
+        message="Failed to retrieve src/orders.py",
+    )
+
+    result = RepositorySymbolIndexer().index(
+        commit_sha="d" * 40,
+        discovery=discovery,
+        file_indexes=(make_file_index(payment_file),),
+        failures=(failure,),
+    )
+
+    assert len(result.files) == 1
+    assert result.files[0].discovered_file.path == "src/payments.py"
+    assert result.failures == (failure,)
+    assert result.is_complete is False
 
 
 def make_discovered_file(
@@ -116,7 +145,10 @@ def test_repository_indexer_rejects_missing_file_indexes() -> None:
 
     discovery = make_discovery_result((payment_file, order_file))
 
-    with pytest.raises(ValueError, match="Missing"):
+    with pytest.raises(
+        ValueError,
+        match="must have either an index or a failure",
+    ):
         RepositorySymbolIndexer().index(
             commit_sha="d" * 40,
             discovery=discovery,
