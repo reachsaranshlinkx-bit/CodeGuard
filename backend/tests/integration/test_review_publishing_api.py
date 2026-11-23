@@ -9,8 +9,10 @@ from codeguard.api.dependencies import get_github_client
 from codeguard.core.config import Settings
 from codeguard.github.exceptions import GitHubPermissionError
 from codeguard.github.schemas import (
+    GitHubGitCommit,
     GitHubPullRequest,
     GitHubPullRequestFile,
+    GitHubRepositoryTree,
 )
 from codeguard.main import create_app
 
@@ -19,6 +21,7 @@ REPO = "CodeGuard"
 PULL_NUMBER = 42
 HEAD_SHA = "b" * 40
 BASE_SHA = "a" * 40
+TREE_SHA = "c" * 40
 
 API_KEY = "test-codeguard-api-key-for-integration-tests"
 
@@ -90,12 +93,14 @@ class FakeGitHubClient:
         changed_file: GitHubPullRequestFile | None = None,
         existing_reviews: list[dict[str, Any]] | None = None,
         lookup_error: Exception | None = None,
+        tree_truncated: bool = False,
     ) -> None:
         self.pull_request = make_pull_request()
         self.files = [changed_file or make_file()]
         self.source = source
         self.existing_reviews = existing_reviews if existing_reviews is not None else []
         self.lookup_error = lookup_error
+        self.tree_truncated = tree_truncated
 
         self.pull_request_calls = 0
         self.content_refs: list[str] = []
@@ -110,6 +115,49 @@ class FakeGitHubClient:
     ) -> GitHubPullRequest:
         self.pull_request_calls += 1
         return self.pull_request
+
+    async def get_git_commit(
+        self,
+        owner: str,
+        repo: str,
+        commit_sha: str,
+    ) -> GitHubGitCommit:
+        return GitHubGitCommit.model_validate(
+            {
+                "sha": commit_sha,
+                "tree": {
+                    "sha": TREE_SHA,
+                    "url": (
+                        f"https://api.github.com/repos/{owner}/{repo}"
+                        f"/git/trees/{TREE_SHA}"
+                    ),
+                },
+            }
+        )
+
+    async def get_repository_tree(
+        self,
+        owner: str,
+        repo: str,
+        tree_sha: str,
+        *,
+        recursive: bool = True,
+    ) -> GitHubRepositoryTree:
+        return GitHubRepositoryTree.model_validate(
+            {
+                "sha": tree_sha,
+                "truncated": self.tree_truncated,
+                "tree": [
+                    {
+                        "path": "src/auth.py",
+                        "mode": "100644",
+                        "type": "blob",
+                        "sha": "d" * 40,
+                        "size": len(self.source.encode("utf-8")),
+                    }
+                ],
+            }
+        )
 
     async def get_all_pull_request_files(
         self,
@@ -202,6 +250,12 @@ def test_publish_endpoint_defaults_to_dry_run() -> None:
         assert response.status_code == 200
 
         data = response.json()
+        context = data["repository_context"]
+
+        assert context["commit_sha"] == HEAD_SHA
+        assert context["is_complete"] is True
+        assert context["indexed_file_count"] == 1
+        assert context["failures"] == []
 
         assert data["status"] == "dry_run"
         assert data["comment_count"] == 1
@@ -453,6 +507,41 @@ def test_publish_endpoint_fails_safely_on_review_lookup_error() -> None:
 
         assert response.status_code == 403
         assert github.review_lookup_calls == 1
+        assert github.created_reviews == []
+
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_publish_endpoint_reports_incomplete_repository_context() -> None:
+    github = FakeGitHubClient(tree_truncated=True)
+
+    client, app = create_test_client(github)
+
+    try:
+        with client:
+            response = client.post(
+                "/api/v1/reviews/publish",
+                json=API_PAYLOAD,
+                headers=API_HEADERS,
+            )
+
+        assert response.status_code == 200
+
+        context = response.json()["repository_context"]
+
+        assert context == {
+            "commit_sha": HEAD_SHA,
+            "is_complete": False,
+            "indexed_file_count": 1,
+            "tree_truncated": True,
+            "file_limit_reached": False,
+            "failures": [],
+        }
+
+        # Default publishing mode must remain a dry run.
+        assert response.json()["status"] == "dry_run"
+        assert github.review_lookup_calls == 0
         assert github.created_reviews == []
 
     finally:

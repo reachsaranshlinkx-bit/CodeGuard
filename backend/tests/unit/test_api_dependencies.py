@@ -5,6 +5,9 @@ from starlette.requests import Request
 
 import codeguard.api.dependencies as dependencies
 from codeguard.api.dependencies import get_webhook_job_queue
+from codeguard.context.repository_context_builder import (
+    RepositoryContextBuilder,
+)
 from codeguard.core.config import Settings
 from codeguard.services.pull_request_analyzer import PullRequestAnalyzer
 from codeguard.webhooks.job_queue import WebhookJobQueue
@@ -101,6 +104,12 @@ def test_analyzer_dependency_uses_provided_github_client() -> None:
 
     assert isinstance(analyzer, PullRequestAnalyzer)
     assert analyzer._github_client is client
+    assert isinstance(
+        analyzer._repository_context_builder,
+        RepositoryContextBuilder,
+    )
+
+    assert analyzer._repository_context_builder._github_client is client
 
 
 def test_get_webhook_job_queue_returns_configured_queue(

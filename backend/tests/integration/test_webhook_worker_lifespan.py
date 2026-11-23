@@ -6,6 +6,9 @@ from threading import Event
 from fastapi.testclient import TestClient
 
 import codeguard.main as main
+from codeguard.context.repository_context_builder import (
+    RepositoryContextBuilder,
+)
 from codeguard.core.config import Settings
 from codeguard.main import run_webhook_worker
 
@@ -154,6 +157,8 @@ def test_enabled_lifespan_processes_queued_job(
             publishing_enabled: bool,
         ) -> None:
             self.arguments = None
+            self.analyzer = analyzer
+            self.github_client = github_client
 
         async def process(
             self,
@@ -216,6 +221,16 @@ def test_enabled_lifespan_processes_queued_job(
         assert len(processors) == 1
 
         processor = processors[0]
+
+        assert isinstance(
+            processor.analyzer._repository_context_builder,
+            RepositoryContextBuilder,
+        )
+
+        assert (
+            processor.analyzer._repository_context_builder._github_client
+            is processor.github_client
+        )
 
         assert processor.arguments == (
             "octocat",

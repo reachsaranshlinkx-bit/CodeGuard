@@ -1,6 +1,15 @@
 import pytest
 
-from codeguard.analyzers.python_ast import PythonAnalysisResult
+from codeguard.analyzers.python_ast import (
+    PythonAnalysisResult,
+    PythonASTAnalyzer,
+)
+from codeguard.context.file_discovery import DiscoveredPythonFile
+from codeguard.context.symbols import (
+    FileSymbolIndex,
+    RepositoryFileFailure,
+    RepositorySymbolIndex,
+)
 from codeguard.github.exceptions import GitHubNotFoundError
 from codeguard.github.schemas import (
     GitHubPullRequest,
@@ -119,6 +128,61 @@ class FakeGitHubClient:
             )
 
         return self.contents[path]
+
+
+class FakeRepositoryContextBuilder:
+    """Fake repository context builder for analyzer tests."""
+
+    def __init__(self, result: RepositorySymbolIndex) -> None:
+        self.result = result
+        self.calls: list[tuple[str, str, str]] = []
+
+    async def build(
+        self,
+        owner: str,
+        repo: str,
+        commit_sha: str,
+    ) -> RepositorySymbolIndex:
+        self.calls.append((owner, repo, commit_sha))
+        return self.result
+
+
+@pytest.mark.asyncio
+async def test_analyzer_builds_repository_context_once_at_pr_head_sha() -> None:
+    context = RepositorySymbolIndex(
+        commit_sha="b" * 40,
+        files=(),
+    )
+
+    context_builder = FakeRepositoryContextBuilder(context)
+
+    client = FakeGitHubClient(
+        files=[
+            make_file("src/auth.py"),
+            make_file("src/users.py"),
+        ],
+        contents={
+            "src/auth.py": "def authenticate():\n    return True\n",
+            "src/users.py": "def get_user():\n    return None\n",
+        },
+    )
+
+    analyzer = PullRequestAnalyzer(
+        github_client=client,
+        repository_context_builder=context_builder,
+    )
+
+    result = await analyzer.analyze(
+        owner="octocat",
+        repo="CodeGuard",
+        pull_number=42,
+    )
+
+    assert context_builder.calls == [
+        ("octocat", "CodeGuard", "b" * 40),
+    ]
+
+    assert result.repository_context is context
 
 
 @pytest.mark.asyncio
@@ -670,3 +734,533 @@ async def test_incomplete_patch_marks_mapping_unavailable() -> None:
     assert file_result.added_line_numbers is None
     assert file_result.changed_line_findings is None
     assert file_result.line_mapping_error == "patch_addition_count_mismatch"
+
+
+@pytest.mark.asyncio
+async def test_analyzer_identifies_changed_functions_and_classes() -> None:
+    source = (
+        "def authenticate(token):\n"
+        "    return str(token)\n"
+        "\n"
+        "class AuthService:\n"
+        "    def verify(self, token):\n"
+        "        return authenticate(token)\n"
+    )
+
+    patch = (
+        "@@ -1,6 +1,6 @@\n"
+        " def authenticate(token):\n"
+        "-    return token\n"
+        "+    return str(token)\n"
+        " \n"
+        "-class LegacyAuthService:\n"
+        "+class AuthService:\n"
+        "     def verify(self, token):\n"
+        "         return authenticate(token)\n"
+    )
+
+    discovered_file = DiscoveredPythonFile(
+        path="src/auth.py",
+        sha="c" * 40,
+        size_bytes=len(source.encode("utf-8")),
+    )
+
+    file_index = FileSymbolIndex(
+        discovered_file=discovered_file,
+        analysis=PythonASTAnalyzer().analyze(
+            source,
+            file_path="src/auth.py",
+        ),
+    )
+
+    context = RepositorySymbolIndex(
+        commit_sha="b" * 40,
+        files=(file_index,),
+    )
+
+    context_builder = FakeRepositoryContextBuilder(context)
+
+    client = FakeGitHubClient(
+        files=[
+            make_file(
+                "src/auth.py",
+                additions=2,
+                deletions=2,
+                patch=patch,
+            )
+        ],
+        contents={"src/auth.py": source},
+    )
+
+    analyzer = PullRequestAnalyzer(
+        github_client=client,
+        repository_context_builder=context_builder,
+    )
+
+    result = await analyzer.analyze("octocat", "CodeGuard", 42)
+
+    file_result = result.files[0]
+
+    assert tuple(
+        function.qualified_name for function in file_result.changed_functions
+    ) == ("authenticate",)
+
+    assert tuple(
+        class_info.qualified_name for class_info in file_result.changed_classes
+    ) == ("AuthService",)
+
+
+@pytest.mark.asyncio
+async def test_analyzer_discovers_callers_in_other_repository_files() -> None:
+    auth_source = "def authenticate(token):\n    return str(token)\n"
+
+    views_source = (
+        "from src.auth import authenticate\n"
+        "\n"
+        "def login(token):\n"
+        "    return authenticate(token)\n"
+    )
+
+    auth_file = DiscoveredPythonFile(
+        path="src/auth.py",
+        sha="c" * 40,
+        size_bytes=len(auth_source.encode("utf-8")),
+    )
+
+    views_file = DiscoveredPythonFile(
+        path="src/views.py",
+        sha="d" * 40,
+        size_bytes=len(views_source.encode("utf-8")),
+    )
+
+    ast_analyzer = PythonASTAnalyzer()
+
+    context = RepositorySymbolIndex(
+        commit_sha="b" * 40,
+        files=(
+            FileSymbolIndex(
+                discovered_file=auth_file,
+                analysis=ast_analyzer.analyze(
+                    auth_source,
+                    file_path="src/auth.py",
+                ),
+            ),
+            FileSymbolIndex(
+                discovered_file=views_file,
+                analysis=ast_analyzer.analyze(
+                    views_source,
+                    file_path="src/views.py",
+                ),
+            ),
+        ),
+    )
+
+    context_builder = FakeRepositoryContextBuilder(context)
+
+    patch = (
+        "@@ -1,2 +1,2 @@\n"
+        " def authenticate(token):\n"
+        "-    return token\n"
+        "+    return str(token)\n"
+    )
+
+    client = FakeGitHubClient(
+        files=[
+            make_file(
+                "src/auth.py",
+                additions=1,
+                deletions=1,
+                patch=patch,
+            )
+        ],
+        contents={"src/auth.py": auth_source},
+    )
+
+    analyzer = PullRequestAnalyzer(
+        github_client=client,
+        repository_context_builder=context_builder,
+    )
+
+    result = await analyzer.analyze("octocat", "CodeGuard", 42)
+
+    callers = result.files[0].related_callers
+
+    assert callers is not None
+
+    assert [
+        (
+            caller.file_path,
+            caller.caller_qualified_name,
+            caller.target_function_qualified_name,
+            caller.lineno,
+        )
+        for caller in callers
+    ] == [
+        ("src/views.py", "login", "authenticate", 4),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_analyzer_discovers_aliased_import_callers() -> None:
+    auth_source = "def authenticate(token):\n    return str(token)\n"
+
+    views_source = (
+        "from src.auth import authenticate as verify_token\n"
+        "\n"
+        "def login(token):\n"
+        "    return verify_token(token)\n"
+    )
+
+    ast_analyzer = PythonASTAnalyzer()
+
+    context = RepositorySymbolIndex(
+        commit_sha="b" * 40,
+        files=(
+            FileSymbolIndex(
+                discovered_file=DiscoveredPythonFile(
+                    path="src/auth.py",
+                    sha="c" * 40,
+                    size_bytes=len(auth_source.encode("utf-8")),
+                ),
+                analysis=ast_analyzer.analyze(
+                    auth_source,
+                    file_path="src/auth.py",
+                ),
+            ),
+            FileSymbolIndex(
+                discovered_file=DiscoveredPythonFile(
+                    path="src/views.py",
+                    sha="d" * 40,
+                    size_bytes=len(views_source.encode("utf-8")),
+                ),
+                analysis=ast_analyzer.analyze(
+                    views_source,
+                    file_path="src/views.py",
+                ),
+            ),
+        ),
+    )
+
+    patch = (
+        "@@ -1,2 +1,2 @@\n"
+        " def authenticate(token):\n"
+        "-    return token\n"
+        "+    return str(token)\n"
+    )
+
+    client = FakeGitHubClient(
+        files=[
+            make_file(
+                "src/auth.py",
+                additions=1,
+                deletions=1,
+                patch=patch,
+            )
+        ],
+        contents={"src/auth.py": auth_source},
+    )
+
+    analyzer = PullRequestAnalyzer(
+        github_client=client,
+        repository_context_builder=FakeRepositoryContextBuilder(context),
+    )
+
+    result = await analyzer.analyze("octocat", "CodeGuard", 42)
+
+    assert result.files[0].related_callers is not None
+
+    assert [
+        (
+            caller.file_path,
+            caller.caller_qualified_name,
+            caller.target_function_qualified_name,
+            caller.lineno,
+        )
+        for caller in result.files[0].related_callers
+    ] == [
+        ("src/views.py", "login", "authenticate", 4),
+    ]
+
+
+@pytest.mark.parametrize(
+    "related_source",
+    [
+        (
+            "def authenticate(token):\n"
+            "    return token\n"
+            "\n"
+            "def login(token):\n"
+            "    return authenticate(token)\n"
+        ),
+        ("from src.auth import authenticate\n\nauthenticate('startup-token')\n"),
+    ],
+    ids=[
+        "unrelated-local-function",
+        "module-level-call",
+    ],
+)
+@pytest.mark.asyncio
+async def test_analyzer_ignores_unrelated_and_module_level_calls(
+    related_source: str,
+) -> None:
+    auth_source = "def authenticate(token):\n    return str(token)\n"
+
+    ast_analyzer = PythonASTAnalyzer()
+
+    context = RepositorySymbolIndex(
+        commit_sha="b" * 40,
+        files=(
+            FileSymbolIndex(
+                discovered_file=DiscoveredPythonFile(
+                    path="src/auth.py",
+                    sha="c" * 40,
+                    size_bytes=len(auth_source.encode("utf-8")),
+                ),
+                analysis=ast_analyzer.analyze(
+                    auth_source,
+                    file_path="src/auth.py",
+                ),
+            ),
+            FileSymbolIndex(
+                discovered_file=DiscoveredPythonFile(
+                    path="src/related.py",
+                    sha="d" * 40,
+                    size_bytes=len(related_source.encode("utf-8")),
+                ),
+                analysis=ast_analyzer.analyze(
+                    related_source,
+                    file_path="src/related.py",
+                ),
+            ),
+        ),
+    )
+
+    patch = (
+        "@@ -1,2 +1,2 @@\n"
+        " def authenticate(token):\n"
+        "-    return token\n"
+        "+    return str(token)\n"
+    )
+
+    client = FakeGitHubClient(
+        files=[
+            make_file(
+                "src/auth.py",
+                additions=1,
+                deletions=1,
+                patch=patch,
+            )
+        ],
+        contents={"src/auth.py": auth_source},
+    )
+
+    analyzer = PullRequestAnalyzer(
+        github_client=client,
+        repository_context_builder=FakeRepositoryContextBuilder(context),
+    )
+
+    result = await analyzer.analyze("octocat", "CodeGuard", 42)
+
+    assert result.files[0].related_callers == ()
+
+
+@pytest.mark.asyncio
+async def test_analyzer_preserves_partial_repository_context_metadata() -> None:
+    source = "def authenticate(token):\n    return str(token)\n"
+
+    discovered_file = DiscoveredPythonFile(
+        path="src/auth.py",
+        sha="c" * 40,
+        size_bytes=len(source.encode("utf-8")),
+    )
+
+    file_index = FileSymbolIndex(
+        discovered_file=discovered_file,
+        analysis=PythonASTAnalyzer().analyze(
+            source,
+            file_path="src/auth.py",
+        ),
+    )
+
+    failure = RepositoryFileFailure(
+        file_path="src/missing.py",
+        stage="retrieval",
+        error_type="GitHubNotFoundError",
+        message="Repository file could not be retrieved.",
+    )
+
+    context = RepositorySymbolIndex(
+        commit_sha="b" * 40,
+        files=(file_index,),
+        tree_truncated=True,
+        file_limit_reached=True,
+        failures=(failure,),
+    )
+
+    patch = (
+        "@@ -1,2 +1,2 @@\n"
+        " def authenticate(token):\n"
+        "-    return token\n"
+        "+    return str(token)\n"
+    )
+
+    client = FakeGitHubClient(
+        files=[
+            make_file(
+                "src/auth.py",
+                additions=1,
+                deletions=1,
+                patch=patch,
+            )
+        ],
+        contents={"src/auth.py": source},
+    )
+
+    analyzer = PullRequestAnalyzer(
+        github_client=client,
+        repository_context_builder=FakeRepositoryContextBuilder(context),
+    )
+
+    result = await analyzer.analyze("octocat", "CodeGuard", 42)
+
+    assert result.repository_context is context
+    assert result.repository_context.is_complete is False
+    assert result.repository_context.tree_truncated is True
+    assert result.repository_context.file_limit_reached is True
+    assert result.repository_context.failures == (failure,)
+
+
+@pytest.mark.asyncio
+async def test_analyzer_marks_symbols_unavailable_when_file_index_failed() -> None:
+    source = "def authenticate(token):\n    return str(token)\n"
+
+    failure = RepositoryFileFailure(
+        file_path="src/auth.py",
+        stage="retrieval",
+        error_type="GitHubNotFoundError",
+        message="Repository context retrieval failed.",
+    )
+
+    context = RepositorySymbolIndex(
+        commit_sha="b" * 40,
+        files=(),
+        failures=(failure,),
+    )
+
+    patch = (
+        "@@ -1,2 +1,2 @@\n"
+        " def authenticate(token):\n"
+        "-    return token\n"
+        "+    return str(token)\n"
+    )
+
+    client = FakeGitHubClient(
+        files=[
+            make_file(
+                "src/auth.py",
+                additions=1,
+                deletions=1,
+                patch=patch,
+            )
+        ],
+        contents={"src/auth.py": source},
+    )
+
+    analyzer = PullRequestAnalyzer(
+        github_client=client,
+        repository_context_builder=FakeRepositoryContextBuilder(context),
+    )
+
+    result = await analyzer.analyze("octocat", "CodeGuard", 42)
+
+    file_result = result.files[0]
+
+    assert result.repository_context is not None
+    assert result.repository_context.is_complete is False
+    assert result.repository_context.failures == (failure,)
+
+    assert file_result.changed_functions is None
+    assert file_result.changed_classes is None
+    assert file_result.related_callers is None
+
+
+@pytest.mark.asyncio
+async def test_analyzer_resolves_imports_from_src_layout_packages() -> None:
+    auth_source = "def authenticate(token):\n    return str(token)\n"
+
+    views_source = (
+        "from codeguard.auth import authenticate\n"
+        "\n"
+        "def login(token):\n"
+        "    return authenticate(token)\n"
+    )
+
+    ast_analyzer = PythonASTAnalyzer()
+
+    context = RepositorySymbolIndex(
+        commit_sha="b" * 40,
+        files=(
+            FileSymbolIndex(
+                discovered_file=DiscoveredPythonFile(
+                    path="src/codeguard/auth.py",
+                    sha="c" * 40,
+                    size_bytes=len(auth_source.encode("utf-8")),
+                ),
+                analysis=ast_analyzer.analyze(
+                    auth_source,
+                    file_path="src/codeguard/auth.py",
+                ),
+            ),
+            FileSymbolIndex(
+                discovered_file=DiscoveredPythonFile(
+                    path="src/codeguard/views.py",
+                    sha="d" * 40,
+                    size_bytes=len(views_source.encode("utf-8")),
+                ),
+                analysis=ast_analyzer.analyze(
+                    views_source,
+                    file_path="src/codeguard/views.py",
+                ),
+            ),
+        ),
+    )
+
+    patch = (
+        "@@ -1,2 +1,2 @@\n"
+        " def authenticate(token):\n"
+        "-    return token\n"
+        "+    return str(token)\n"
+    )
+
+    client = FakeGitHubClient(
+        files=[
+            make_file(
+                "src/codeguard/auth.py",
+                additions=1,
+                deletions=1,
+                patch=patch,
+            )
+        ],
+        contents={"src/codeguard/auth.py": auth_source},
+    )
+
+    analyzer = PullRequestAnalyzer(
+        github_client=client,
+        repository_context_builder=FakeRepositoryContextBuilder(context),
+    )
+
+    result = await analyzer.analyze("octocat", "CodeGuard", 42)
+
+    assert result.files[0].related_callers is not None
+
+    assert [
+        (
+            caller.file_path,
+            caller.caller_qualified_name,
+            caller.target_function_qualified_name,
+            caller.lineno,
+        )
+        for caller in result.files[0].related_callers
+    ] == [
+        ("src/codeguard/views.py", "login", "authenticate", 4),
+    ]
