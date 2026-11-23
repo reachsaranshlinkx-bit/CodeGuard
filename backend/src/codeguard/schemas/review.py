@@ -60,6 +60,52 @@ class SeverityCountsResponse(BaseModel):
     info: int = Field(ge=0, strict=True)
 
 
+class RepositoryFileFailureResponse(BaseModel):
+    """Safe API representation of a repository file processing failure."""
+
+    model_config = ConfigDict(
+        extra="forbid",
+        str_strip_whitespace=True,
+    )
+
+    file_path: str = Field(min_length=1)
+    stage: Literal["retrieval", "analysis"]
+    error_type: str = Field(min_length=1)
+
+
+class RepositoryContextResponse(BaseModel):
+    """API representation of repository context completeness."""
+
+    model_config = ConfigDict(
+        extra="forbid",
+        str_strip_whitespace=True,
+    )
+
+    commit_sha: str = Field(min_length=1)
+    is_complete: bool = Field(strict=True)
+    indexed_file_count: int = Field(ge=0, strict=True)
+    tree_truncated: bool = Field(strict=True)
+    file_limit_reached: bool = Field(strict=True)
+    failures: tuple[RepositoryFileFailureResponse, ...] = ()
+
+    @model_validator(mode="after")
+    def validate_completeness(self) -> Self:
+        """Ensure completeness agrees with repository processing metadata."""
+
+        expected_complete = (
+            not self.tree_truncated
+            and not self.file_limit_reached
+            and not self.failures
+        )
+
+        if self.is_complete != expected_complete:
+            raise ValueError(
+                "is_complete must match repository context completeness metadata."
+            )
+
+        return self
+
+
 class ReviewResponse(BaseModel):
     """Structured security review API response."""
 
@@ -84,6 +130,7 @@ class ReviewResponse(BaseModel):
     total_findings: int = Field(ge=0, strict=True)
 
     severity_counts: SeverityCountsResponse
+    repository_context: RepositoryContextResponse | None = None
 
     @model_validator(mode="after")
     def validate_report_counts(self) -> Self:
@@ -158,3 +205,4 @@ class ReviewPublishResponse(BaseModel):
     review_body: str = Field(min_length=1)
 
     comments: tuple[ReviewPublishCommentResponse, ...]
+    repository_context: RepositoryContextResponse | None = None

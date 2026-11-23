@@ -5,6 +5,10 @@ from pydantic import SecretStr
 from codeguard.analyzers.python_ast import PythonAnalysisResult
 from codeguard.analyzers.python_risk import RiskFinding
 from codeguard.api.dependencies import get_pull_request_analyzer
+from codeguard.context.symbols import (
+    RepositoryFileFailure,
+    RepositorySymbolIndex,
+)
 from codeguard.core.config import Settings
 from codeguard.github.exceptions import GitHubNotFoundError
 from codeguard.main import create_app
@@ -26,7 +30,9 @@ API_HEADERS = {
 }
 
 
-def make_analysis() -> PullRequestAnalysisResult:
+def make_analysis(
+    repository_context: RepositorySymbolIndex | None = None,
+) -> PullRequestAnalysisResult:
     finding = RiskFinding(
         rule_id="PY001",
         severity="high",
@@ -68,6 +74,7 @@ def make_analysis() -> PullRequestAnalysisResult:
         base_sha="def456",
         html_url="https://github.com/octocat/CodeGuard/pull/42",
         files=(file_result,),
+        repository_context=repository_context,
     )
 
 
@@ -77,8 +84,10 @@ class FakePullRequestAnalyzer:
     def __init__(
         self,
         error: Exception | None = None,
+        analysis: PullRequestAnalysisResult | None = None,
     ) -> None:
         self.error = error
+        self.analysis = analysis
         self.calls: list[tuple[str, str, int]] = []
 
     async def analyze(
@@ -92,7 +101,7 @@ class FakePullRequestAnalyzer:
         if self.error is not None:
             raise self.error
 
-        return make_analysis()
+        return self.analysis or make_analysis()
 
 
 def create_test_client(
@@ -202,5 +211,58 @@ def test_review_endpoint_maps_github_not_found_to_404() -> None:
         assert response.json()["detail"] == (
             "GitHub repository or pull request not found."
         )
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_review_endpoint_exposes_incomplete_repository_context() -> None:
+    failure = RepositoryFileFailure(
+        file_path="src/missing.py",
+        stage="retrieval",
+        error_type="GitHubNotFoundError",
+        message="Internal retrieval error details.",
+    )
+
+    context = RepositorySymbolIndex(
+        commit_sha="abc123",
+        files=(),
+        failures=(failure,),
+    )
+
+    analyzer = FakePullRequestAnalyzer(
+        analysis=make_analysis(repository_context=context),
+    )
+
+    client, app = create_test_client(analyzer)
+
+    try:
+        with client:
+            response = client.post(
+                "/api/v1/reviews",
+                json=API_PAYLOAD,
+                headers=API_HEADERS,
+            )
+
+        assert response.status_code == 200
+
+        data = response.json()
+        context_data = data["repository_context"]
+
+        assert context_data["commit_sha"] == "abc123"
+        assert context_data["is_complete"] is False
+        assert context_data["indexed_file_count"] == 0
+        assert context_data["tree_truncated"] is False
+        assert context_data["file_limit_reached"] is False
+
+        assert context_data["failures"] == [
+            {
+                "file_path": "src/missing.py",
+                "stage": "retrieval",
+                "error_type": "GitHubNotFoundError",
+            }
+        ]
+
+        assert "message" not in context_data["failures"][0]
+
     finally:
         app.dependency_overrides.clear()

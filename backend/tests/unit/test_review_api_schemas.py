@@ -2,6 +2,7 @@ import pytest
 from pydantic import ValidationError
 
 from codeguard.schemas.review import (
+    RepositoryContextResponse,
     ReviewFindingResponse,
     ReviewRequest,
     ReviewResponse,
@@ -195,3 +196,47 @@ def test_review_response_rejects_inconsistent_severity_counts() -> None:
         match="severity_counts",
     ):
         ReviewResponse.model_validate(payload)
+
+
+def test_repository_context_response_accepts_partial_context() -> None:
+    context = RepositoryContextResponse.model_validate(
+        {
+            "commit_sha": "a" * 40,
+            "is_complete": False,
+            "indexed_file_count": 3,
+            "tree_truncated": False,
+            "file_limit_reached": False,
+            "failures": [
+                {
+                    "file_path": "src/missing.py",
+                    "stage": "retrieval",
+                    "error_type": "GitHubNotFoundError",
+                }
+            ],
+        }
+    )
+
+    assert context.is_complete is False
+    assert context.indexed_file_count == 3
+    assert len(context.failures) == 1
+    assert context.failures[0].file_path == "src/missing.py"
+
+
+def test_repository_context_response_rejects_inconsistent_completeness() -> None:
+    with pytest.raises(ValidationError, match="is_complete"):
+        RepositoryContextResponse.model_validate(
+            {
+                "commit_sha": "a" * 40,
+                "is_complete": True,
+                "indexed_file_count": 3,
+                "tree_truncated": False,
+                "file_limit_reached": False,
+                "failures": [
+                    {
+                        "file_path": "src/missing.py",
+                        "stage": "analysis",
+                        "error_type": "SyntaxError",
+                    }
+                ],
+            }
+        )

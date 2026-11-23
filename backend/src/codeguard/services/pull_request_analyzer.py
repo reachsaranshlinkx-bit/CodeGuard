@@ -5,6 +5,8 @@ from pathlib import PurePosixPath
 from typing import Protocol
 
 from codeguard.analyzers.python_ast import (
+    ClassInfo,
+    FunctionInfo,
     PythonAnalysisResult,
     PythonASTAnalyzer,
 )
@@ -12,6 +14,7 @@ from codeguard.analyzers.python_risk import (
     PythonRiskAnalyzer,
     RiskFinding,
 )
+from codeguard.context.symbols import RepositorySymbolIndex
 from codeguard.github.exceptions import GitHubError
 from codeguard.github.schemas import (
     GitHubPullRequest,
@@ -49,6 +52,27 @@ class GitHubClientProtocol(Protocol):
     ) -> str: ...
 
 
+class RepositoryContextBuilderProtocol(Protocol):
+    """Interface required to build repository context."""
+
+    async def build(
+        self,
+        owner: str,
+        repo: str,
+        commit_sha: str,
+    ) -> RepositorySymbolIndex: ...
+
+
+@dataclass(frozen=True, slots=True)
+class RelatedCaller:
+    """A function that calls a changed repository function."""
+
+    file_path: str
+    caller_qualified_name: str
+    target_function_qualified_name: str
+    lineno: int
+
+
 @dataclass(frozen=True, slots=True)
 class FileAnalysisResult:
     """Analysis result for one changed pull request file."""
@@ -69,6 +93,9 @@ class FileAnalysisResult:
 
     skip_reason: str | None = None
     error: str | None = None
+    changed_functions: tuple[FunctionInfo, ...] | None = None
+    changed_classes: tuple[ClassInfo, ...] | None = None
+    related_callers: tuple[RelatedCaller, ...] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -84,6 +111,7 @@ class PullRequestAnalysisResult:
     base_sha: str
     html_url: str
     files: tuple[FileAnalysisResult, ...]
+    repository_context: RepositorySymbolIndex | None = None
 
 
 class PullRequestAnalyzer:
@@ -94,10 +122,12 @@ class PullRequestAnalyzer:
         github_client: GitHubClientProtocol,
         ast_analyzer: PythonASTAnalyzer | None = None,
         risk_analyzer: PythonRiskAnalyzer | None = None,
+        repository_context_builder: RepositoryContextBuilderProtocol | None = None,
     ) -> None:
         self._github_client = github_client
         self._ast_analyzer = ast_analyzer or PythonASTAnalyzer()
         self._risk_analyzer = risk_analyzer or PythonRiskAnalyzer()
+        self._repository_context_builder = repository_context_builder
 
     async def analyze(
         self,
@@ -136,6 +166,14 @@ class PullRequestAnalyzer:
             repo,
             pull_number,
         )
+        repository_context = None
+
+        if self._repository_context_builder is not None:
+            repository_context = await self._repository_context_builder.build(
+                owner=owner,
+                repo=repo,
+                commit_sha=pull_request.head.sha,
+            )
 
         file_results: list[FileAnalysisResult] = []
 
@@ -145,6 +183,7 @@ class PullRequestAnalyzer:
                 repo=repo,
                 head_sha=pull_request.head.sha,
                 changed_file=changed_file,
+                repository_context=repository_context,
             )
 
             file_results.append(file_result)
@@ -159,6 +198,7 @@ class PullRequestAnalyzer:
             base_sha=pull_request.base.sha,
             html_url=str(pull_request.html_url),
             files=tuple(file_results),
+            repository_context=repository_context,
         )
 
     async def _analyze_file(
@@ -167,6 +207,7 @@ class PullRequestAnalyzer:
         repo: str,
         head_sha: str,
         changed_file: GitHubPullRequestFile,
+        repository_context: RepositorySymbolIndex | None,
     ) -> FileAnalysisResult:
         """Analyze a changed file and map findings to added lines."""
 
@@ -267,6 +308,17 @@ class PullRequestAnalyzer:
                 changed_line_findings = None
                 line_mapping_error = f"{type(exc).__name__}: {exc}"
 
+        changed_functions, changed_classes = self._find_changed_symbols(
+            file_path=filename,
+            added_line_numbers=added_line_numbers,
+            repository_context=repository_context,
+        )
+        related_callers = self._find_related_callers(
+            changed_file_path=filename,
+            changed_functions=changed_functions,
+            repository_context=repository_context,
+        )
+
         return FileAnalysisResult(
             file_path=filename,
             status=changed_file.status,
@@ -279,7 +331,159 @@ class PullRequestAnalyzer:
             added_line_numbers=added_line_numbers,
             changed_line_findings=changed_line_findings,
             line_mapping_error=line_mapping_error,
+            changed_functions=changed_functions,
+            changed_classes=changed_classes,
+            related_callers=related_callers,
         )
+
+    @staticmethod
+    def _find_related_callers(
+        changed_file_path: str,
+        changed_functions: tuple[FunctionInfo, ...] | None,
+        repository_context: RepositorySymbolIndex | None,
+    ) -> tuple[RelatedCaller, ...] | None:
+        """Find direct callers of changed top-level imported functions."""
+
+        if changed_functions is None or repository_context is None:
+            return None
+
+        if not changed_functions:
+            return ()
+
+        # Map Python module names to repository file paths.
+        module_to_paths: dict[str, set[str]] = {}
+
+        for file_index in repository_context.files:
+            path = file_index.discovered_file.path
+
+            if not path.endswith(".py"):
+                continue
+
+            module_path = path[:-3]
+
+            if module_path.endswith("/__init__"):
+                module_path = module_path[:-9]
+
+            module_name = module_path.replace("/", ".")
+
+            # Support both repository-relative imports and src-layout imports.
+            module_names = {module_name}
+
+            if module_name.startswith("src."):
+                module_names.add(module_name.removeprefix("src."))
+
+            for candidate_name in module_names:
+                module_to_paths.setdefault(candidate_name, set()).add(path)
+
+        changed_functions_by_name = {
+            function.qualified_name: function for function in changed_functions
+        }
+
+        related_callers: list[RelatedCaller] = []
+        seen: set[tuple[str, str, str, int]] = set()
+
+        # Inspect every other indexed repository file.
+        for caller_file in repository_context.files:
+            caller_path = caller_file.discovered_file.path
+
+            if caller_path == changed_file_path:
+                continue
+
+            for imported in caller_file.analysis.imports:
+                # Only resolve explicit absolute imports at this stage.
+                if imported.level != 0 or imported.module is None:
+                    continue
+
+                target_paths = module_to_paths.get(imported.module, set())
+
+                # Resolve only when the import uniquely identifies this file.
+                if target_paths != {changed_file_path}:
+                    continue
+
+                target_function = changed_functions_by_name.get(imported.name)
+
+                if target_function is None:
+                    continue
+
+                local_name = imported.alias or imported.name
+
+                for call in caller_file.analysis.calls:
+                    if call.callee != local_name:
+                        continue
+
+                    if call.caller_qualified_name is None:
+                        continue
+
+                    key = (
+                        caller_path,
+                        call.caller_qualified_name,
+                        target_function.qualified_name,
+                        call.lineno,
+                    )
+
+                    if key in seen:
+                        continue
+
+                    seen.add(key)
+
+                    related_callers.append(
+                        RelatedCaller(
+                            file_path=caller_path,
+                            caller_qualified_name=call.caller_qualified_name,
+                            target_function_qualified_name=(
+                                target_function.qualified_name
+                            ),
+                            lineno=call.lineno,
+                        )
+                    )
+
+        return tuple(related_callers)
+
+    @staticmethod
+    def _find_changed_symbols(
+        file_path: str,
+        added_line_numbers: frozenset[int] | None,
+        repository_context: RepositorySymbolIndex | None,
+    ) -> tuple[
+        tuple[FunctionInfo, ...] | None,
+        tuple[ClassInfo, ...] | None,
+    ]:
+        """Find repository symbols whose source ranges overlap added lines."""
+
+        if added_line_numbers is None or repository_context is None:
+            return None, None
+
+        file_index = next(
+            (
+                candidate
+                for candidate in repository_context.files
+                if candidate.discovered_file.path == file_path
+            ),
+            None,
+        )
+
+        if file_index is None:
+            return None, None
+
+        changed_functions = tuple(
+            function
+            for function in file_index.analysis.functions
+            if any(
+                function.lineno <= line <= function.end_lineno
+                for line in added_line_numbers
+            )
+        )
+
+        changed_classes = tuple(
+            class_info
+            for class_info in file_index.analysis.classes
+            if any(
+                class_info.lineno <= line <= class_info.end_lineno
+                for line in added_line_numbers
+            )
+        )
+
+        return changed_functions, changed_classes
 
     @staticmethod
     def _skipped_file(

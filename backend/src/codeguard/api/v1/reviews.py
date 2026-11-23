@@ -9,6 +9,7 @@ from codeguard.api.dependencies import (
     get_pull_request_analyzer,
     require_api_key,
 )
+from codeguard.context.symbols import RepositorySymbolIndex
 from codeguard.core.config import Settings, get_settings
 from codeguard.github.client import GitHubClient
 from codeguard.github.exceptions import (
@@ -21,6 +22,8 @@ from codeguard.github.exceptions import (
 from codeguard.review.report_builder import build_review_report
 from codeguard.review.review_publisher import ReviewPublisher
 from codeguard.schemas.review import (
+    RepositoryContextResponse,
+    RepositoryFileFailureResponse,
     ReviewFindingResponse,
     ReviewPublishCommentResponse,
     ReviewPublishRequest,
@@ -35,6 +38,33 @@ router = APIRouter(
     prefix="/api/v1",
     tags=["reviews"],
 )
+
+
+def build_repository_context_response(
+    context: RepositorySymbolIndex | None,
+) -> RepositoryContextResponse | None:
+    """Convert repository context into a safe API response."""
+
+    if context is None:
+        return None
+
+    failures = tuple(
+        RepositoryFileFailureResponse(
+            file_path=failure.file_path,
+            stage=failure.stage,
+            error_type=failure.error_type,
+        )
+        for failure in context.failures
+    )
+
+    return RepositoryContextResponse(
+        commit_sha=context.commit_sha,
+        is_complete=context.is_complete,
+        indexed_file_count=len(context.files),
+        tree_truncated=context.tree_truncated,
+        file_limit_reached=context.file_limit_reached,
+        failures=failures,
+    )
 
 
 @router.post(
@@ -76,6 +106,9 @@ async def create_review(
             total_findings=report.total_findings,
             severity_counts=SeverityCountsResponse.model_validate(
                 report.severity_counts
+            ),
+            repository_context=build_repository_context_response(
+                analysis.repository_context
             ),
         )
 
@@ -174,6 +207,9 @@ async def publish_review(
             status=result.status,
             comment_count=result.comment_count,
             review_body=result.review_body,
+            repository_context=build_repository_context_response(
+                analysis.repository_context
+            ),
             comments=tuple(
                 ReviewPublishCommentResponse.model_validate(comment.to_github_payload())
                 for comment in result.comments

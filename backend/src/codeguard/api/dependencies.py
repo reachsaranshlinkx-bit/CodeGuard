@@ -4,6 +4,9 @@ from typing import Annotated
 
 from fastapi import Depends, Header, HTTPException, Request, status
 
+from codeguard.context.repository_context_builder import (
+    RepositoryContextBuilder,
+)
 from codeguard.core.config import Settings, get_settings
 from codeguard.github.client import GitHubClient
 from codeguard.services.pull_request_analyzer import PullRequestAnalyzer
@@ -41,7 +44,10 @@ def get_pull_request_analyzer(
 ) -> PullRequestAnalyzer:
     """Provide a pull request analyzer using the injected GitHub client."""
 
-    return PullRequestAnalyzer(github_client=github_client)
+    return PullRequestAnalyzer(
+        github_client=github_client,
+        repository_context_builder=RepositoryContextBuilder(github_client),
+    )
 
 
 def require_api_key(

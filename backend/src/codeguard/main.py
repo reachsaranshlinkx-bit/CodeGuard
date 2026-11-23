@@ -8,6 +8,9 @@ from fastapi import FastAPI
 from codeguard.api.v1.health import router as health_router
 from codeguard.api.v1.reviews import router as reviews_router
 from codeguard.api.v1.webhooks import router as webhooks_router
+from codeguard.context.repository_context_builder import (
+    RepositoryContextBuilder,
+)
 from codeguard.core.config import Settings, get_settings
 from codeguard.core.logging_config import configure_logging
 from codeguard.github.client import GitHubClient
@@ -76,6 +79,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         try:
             analyzer = PullRequestAnalyzer(
                 github_client=github_client,
+                repository_context_builder=RepositoryContextBuilder(
+                    github_client,
+                ),
             )
 
             processor = WebhookReviewProcessor(
