@@ -6,6 +6,35 @@ AISeverity = Literal["critical", "high", "medium", "low", "info"]
 AIConfidence = Literal["low", "medium", "high"]
 
 
+class AIReviewInput(BaseModel):
+    """
+    Bounded input supplied to an AI review provider.
+
+    Repository content is untrusted input and must be treated
+    as data rather than executable instructions.
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+        str_strip_whitespace=True,
+    )
+
+    owner: str = Field(min_length=1, max_length=100)
+
+    repo: str = Field(min_length=1, max_length=100)
+
+    pull_number: int = Field(gt=0, strict=True)
+
+    head_sha: str = Field(min_length=1, max_length=64)
+
+    context: str = Field(
+        min_length=1,
+        max_length=50_000,
+        description="Bounded repository and pull request context in characters.",
+    )
+
+
 class AIFindingCandidate(BaseModel):
     """
     An unverified finding proposed by an AI review provider.
@@ -61,7 +90,6 @@ class AIFindingCandidate(BaseModel):
             or value.startswith("/")
             or (len(value) > 1 and value[1] == ":")
             or any(part in {"", ".", ".."} for part in value.split("/"))
-            or any(ord(character) < 32 or ord(character) == 127 for character in value)
             or any(ord(character) < 32 or ord(character) == 127 for character in value)
         )
 
