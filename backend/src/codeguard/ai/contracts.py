@@ -1,6 +1,12 @@
-from typing import Literal
+from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StringConstraints,
+    field_validator,
+)
 
 AISeverity = Literal["critical", "high", "medium", "low", "info"]
 AIConfidence = Literal["low", "medium", "high"]
@@ -68,7 +74,10 @@ class AIFindingCandidate(BaseModel):
 
     problem: str = Field(min_length=1, max_length=3000)
 
-    evidence: str = Field(
+    evidence: Annotated[
+        str,
+        StringConstraints(strip_whitespace=False),
+    ] = Field(
         min_length=1,
         max_length=4000,
         description="Exact source-code excerpt supporting the proposed finding.",
@@ -95,6 +104,16 @@ class AIFindingCandidate(BaseModel):
 
         if invalid_path:
             raise ValueError("file_path must be a safe repository-relative POSIX path.")
+
+        return value
+
+    @field_validator("evidence")
+    @classmethod
+    def validate_evidence(cls, value: str) -> str:
+        """Reject blank evidence without modifying meaningful whitespace."""
+
+        if not value.strip():
+            raise ValueError("evidence must contain non-whitespace source content.")
 
         return value
 
