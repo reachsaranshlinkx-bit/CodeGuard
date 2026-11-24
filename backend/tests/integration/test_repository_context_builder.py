@@ -1,7 +1,10 @@
 import pytest
 
 from codeguard.context.repository_context_builder import RepositoryContextBuilder
-from codeguard.context.symbols import RepositoryFileFailure
+from codeguard.context.source_snapshot import RepositoryContextBuildResult
+from codeguard.context.symbols import (
+    RepositoryFileFailure,
+)
 from codeguard.github.schemas import GitHubGitCommit, GitHubRepositoryTree
 
 COMMIT_SHA = "a" * 40
@@ -357,3 +360,151 @@ async def test_builder_keeps_valid_files_when_syntax_is_invalid() -> None:
     assert failure.error_type == "SyntaxError"
     assert failure.message
     assert result.is_complete is False
+
+
+async def test_build_with_source_preserves_source_and_symbol_index() -> None:
+    source = "def authenticate():\n    return True\n"
+
+    client = FakeGitHubClient(
+        make_repository_tree(("src/auth.py",)),
+        {"src/auth.py": source},
+    )
+
+    builder = RepositoryContextBuilder(client)
+
+    result = await builder.build_with_source(
+        owner="octocat",
+        repo="CodeGuard",
+        commit_sha=COMMIT_SHA,
+    )
+
+    assert isinstance(result, RepositoryContextBuildResult)
+    assert result.symbol_index.commit_sha == COMMIT_SHA
+    assert result.source_snapshot.commit_sha == COMMIT_SHA
+
+    assert len(result.symbol_index.files) == 1
+    assert result.source_snapshot.files[0].source == source
+    assert result.source_snapshot.files[0].path == "src/auth.py"
+
+    assert result.source_snapshot.total_source_bytes == len(source.encode("utf-8"))
+    assert result.source_snapshot.is_complete is True
+
+
+async def test_build_with_source_preserves_source_when_ast_fails() -> None:
+    valid_source = "def process_payment(): pass\n"
+    invalid_source = "def broken(:\n    pass\n"
+
+    client = FakeGitHubClient(
+        make_repository_tree(("src/payments.py", "src/orders.py")),
+        {
+            "src/payments.py": valid_source,
+            "src/orders.py": invalid_source,
+        },
+    )
+
+    builder = RepositoryContextBuilder(client)
+
+    result = await builder.build_with_source(
+        owner="octocat",
+        repo="CodeGuard",
+        commit_sha=COMMIT_SHA,
+    )
+
+    snapshot_by_path = {
+        source_file.path: source_file for source_file in result.source_snapshot.files
+    }
+
+    assert snapshot_by_path["src/orders.py"].source == invalid_source
+    assert snapshot_by_path["src/payments.py"].source == valid_source
+
+    assert len(result.symbol_index.files) == 1
+    assert len(result.symbol_index.failures) == 1
+    assert result.symbol_index.failures[0].stage == "analysis"
+
+    # Source coverage is complete even though AST analysis failed.
+    assert result.source_snapshot.is_complete is True
+    assert result.symbol_index.is_complete is False
+
+
+async def test_build_with_source_tracks_retrieval_failure() -> None:
+    client = FakeGitHubClient(
+        make_repository_tree(("src/auth.py", "src/orders.py")),
+        {
+            "src/auth.py": "def authenticate(): pass\n",
+            "src/orders.py": "def create_order(): pass\n",
+        },
+    )
+    client.file_error_path = "src/orders.py"
+
+    builder = RepositoryContextBuilder(client)
+
+    result = await builder.build_with_source(
+        owner="octocat",
+        repo="CodeGuard",
+        commit_sha=COMMIT_SHA,
+    )
+
+    assert [item.path for item in result.source_snapshot.files] == ["src/auth.py"]
+
+    assert len(result.source_snapshot.failures) == 1
+    assert result.source_snapshot.failures[0].file_path == "src/orders.py"
+    assert result.source_snapshot.is_complete is False
+
+
+async def test_build_with_source_enforces_aggregate_budget() -> None:
+    large_source = "VALUE = 'large'\n"
+    small_source = "x=1\n"
+
+    budget = len(small_source.encode("utf-8"))
+
+    client = FakeGitHubClient(
+        make_repository_tree(("src/a.py", "src/b.py")),
+        {
+            "src/a.py": large_source,
+            "src/b.py": small_source,
+        },
+    )
+
+    builder = RepositoryContextBuilder(
+        client,
+        max_source_snapshot_bytes=budget,
+    )
+
+    result = await builder.build_with_source(
+        owner="octocat",
+        repo="CodeGuard",
+        commit_sha=COMMIT_SHA,
+    )
+
+    assert [item.path for item in result.source_snapshot.files] == ["src/b.py"]
+
+    assert result.source_snapshot.omitted_source_paths == ("src/a.py",)
+    assert result.source_snapshot.total_source_bytes <= budget
+    assert result.source_snapshot.is_complete is False
+
+
+async def test_build_with_source_preserves_tree_and_file_limit_metadata() -> None:
+    client = FakeGitHubClient(
+        make_repository_tree(
+            ("src/a.py", "src/b.py"),
+            truncated=True,
+        ),
+        {
+            "src/a.py": "x=1\n",
+        },
+    )
+
+    builder = RepositoryContextBuilder(
+        client,
+        max_files=1,
+    )
+
+    result = await builder.build_with_source(
+        owner="octocat",
+        repo="CodeGuard",
+        commit_sha=COMMIT_SHA,
+    )
+
+    assert result.source_snapshot.tree_truncated is True
+    assert result.source_snapshot.file_limit_reached is True
+    assert result.source_snapshot.is_complete is False
