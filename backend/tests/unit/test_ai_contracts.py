@@ -156,3 +156,25 @@ def test_ai_review_input_rejects_oversized_context() -> None:
 
     with pytest.raises(ValidationError):
         AIReviewInput.model_validate(payload)
+
+
+def test_ai_finding_candidate_preserves_evidence_whitespace() -> None:
+    evidence = "    return True\n    raise ValueError()\n"
+
+    payload = make_candidate_payload()
+    payload["evidence"] = evidence
+
+    candidate = AIFindingCandidate.model_validate(payload)
+
+    assert candidate.evidence == evidence
+
+
+def test_ai_finding_candidate_rejects_whitespace_only_evidence() -> None:
+    payload = make_candidate_payload()
+    payload["evidence"] = " \n\t "
+
+    with pytest.raises(
+        ValidationError,
+        match="non-whitespace source content",
+    ):
+        AIFindingCandidate.model_validate(payload)
