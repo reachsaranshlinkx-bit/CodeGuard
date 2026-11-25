@@ -1,8 +1,8 @@
 from collections.abc import Callable
 
 import pytest
-from codeguard.ai.context_builder import AIReviewContextBuilder
 
+from codeguard.ai.context_builder import AIReviewContextBuilder
 from codeguard.ai.contracts import AIReviewInput
 from codeguard.context.file_discovery import DiscoveredPythonFile
 from codeguard.context.source_snapshot import (
