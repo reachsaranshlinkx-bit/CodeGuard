@@ -4,6 +4,9 @@ from dataclasses import dataclass
 from pathlib import PurePosixPath
 from typing import Protocol
 
+from codeguard.ai.context_builder import AIReviewContextBuilder
+from codeguard.ai.contracts import AIReviewInput
+from codeguard.ai.engine import AIReviewEngine, AIReviewExecutionResult
 from codeguard.analyzers.python_ast import (
     ClassInfo,
     FunctionInfo,
@@ -14,6 +17,7 @@ from codeguard.analyzers.python_risk import (
     PythonRiskAnalyzer,
     RiskFinding,
 )
+from codeguard.context.source_snapshot import RepositoryContextBuildResult
 from codeguard.context.symbols import RepositorySymbolIndex
 from codeguard.github.exceptions import GitHubError
 from codeguard.github.schemas import (
@@ -112,6 +116,7 @@ class PullRequestAnalysisResult:
     html_url: str
     files: tuple[FileAnalysisResult, ...]
     repository_context: RepositorySymbolIndex | None = None
+    ai_review_result: AIReviewExecutionResult | None = None
 
 
 class PullRequestAnalyzer:
@@ -123,11 +128,19 @@ class PullRequestAnalyzer:
         ast_analyzer: PythonASTAnalyzer | None = None,
         risk_analyzer: PythonRiskAnalyzer | None = None,
         repository_context_builder: RepositoryContextBuilderProtocol | None = None,
+        ai_review_engine: AIReviewEngine | None = None,
+        ai_review_context_builder: AIReviewContextBuilder | None = None,
     ) -> None:
         self._github_client = github_client
         self._ast_analyzer = ast_analyzer or PythonASTAnalyzer()
         self._risk_analyzer = risk_analyzer or PythonRiskAnalyzer()
         self._repository_context_builder = repository_context_builder
+        self._ai_review_engine = ai_review_engine
+        self._ai_review_context_builder = (
+            ai_review_context_builder
+            if ai_review_context_builder is not None
+            else AIReviewContextBuilder()
+        )
 
     async def analyze(
         self,
@@ -167,12 +180,46 @@ class PullRequestAnalyzer:
             pull_number,
         )
         repository_context = None
+        source_snapshot = None
 
         if self._repository_context_builder is not None:
-            repository_context = await self._repository_context_builder.build(
-                owner=owner,
-                repo=repo,
-                commit_sha=pull_request.head.sha,
+            if self._ai_review_engine is None:
+                repository_context = await self._repository_context_builder.build(
+                    owner=owner,
+                    repo=repo,
+                    commit_sha=pull_request.head.sha,
+                )
+            else:
+                build_with_source = getattr(
+                    self._repository_context_builder,
+                    "build_with_source",
+                    None,
+                )
+
+                if not callable(build_with_source):
+                    raise TypeError(
+                        "AI review requires a repository context builder with "
+                        "a build_with_source() method."
+                    )
+
+                context_result = await build_with_source(
+                    owner=owner,
+                    repo=repo,
+                    commit_sha=pull_request.head.sha,
+                )
+
+                if not isinstance(context_result, RepositoryContextBuildResult):
+                    raise TypeError(
+                        "Repository context builder build_with_source() must "
+                        "return a RepositoryContextBuildResult."
+                    )
+
+                repository_context = context_result.symbol_index
+                source_snapshot = context_result.source_snapshot
+        elif self._ai_review_engine is not None:
+            raise TypeError(
+                "AI review requires a repository context builder with "
+                "a build_with_source() method."
             )
 
         file_results: list[FileAnalysisResult] = []
@@ -188,6 +235,44 @@ class PullRequestAnalyzer:
 
             file_results.append(file_result)
 
+        ai_review_result = None
+
+        if self._ai_review_engine is not None:
+            if source_snapshot is None:
+                raise RuntimeError(
+                    "AI review cannot proceed without a repository source snapshot."
+                )
+
+            changed_file_paths = tuple(
+                file_result.file_path
+                for file_result in file_results
+                if file_result.ast_result is not None
+            )
+            related_file_paths = tuple(
+                caller.file_path
+                for file_result in file_results
+                if file_result.related_callers is not None
+                for caller in file_result.related_callers
+            )
+            context = self._ai_review_context_builder.build(
+                changed_file_paths=changed_file_paths,
+                related_file_paths=related_file_paths,
+                source_snapshot=source_snapshot,
+            )
+
+            if context is not None:
+                review_input = AIReviewInput(
+                    owner=owner,
+                    repo=repo,
+                    pull_number=pull_request.number,
+                    head_sha=pull_request.head.sha,
+                    context=context,
+                )
+                ai_review_result = await self._ai_review_engine.review(
+                    review_input,
+                    source_snapshot,
+                )
+
         return PullRequestAnalysisResult(
             owner=owner,
             repo=repo,
@@ -199,6 +284,7 @@ class PullRequestAnalyzer:
             html_url=str(pull_request.html_url),
             files=tuple(file_results),
             repository_context=repository_context,
+            ai_review_result=ai_review_result,
         )
 
     async def _analyze_file(

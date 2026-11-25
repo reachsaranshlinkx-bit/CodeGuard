@@ -22,6 +22,9 @@ from codeguard.github.exceptions import (
 from codeguard.review.report_builder import build_review_report
 from codeguard.review.review_publisher import ReviewPublisher
 from codeguard.schemas.review import (
+    AIFindingCandidateResponse,
+    AIReviewAssessmentResponse,
+    EvidenceMatchResponse,
     RepositoryContextResponse,
     RepositoryFileFailureResponse,
     ReviewFindingResponse,
@@ -109,6 +112,22 @@ async def create_review(
             ),
             repository_context=build_repository_context_response(
                 analysis.repository_context
+            ),
+            ai_review_summary=report.ai_review_summary,
+            ai_assessments=tuple(
+                AIReviewAssessmentResponse(
+                    candidate=AIFindingCandidateResponse.model_validate(
+                        assessment.candidate.model_dump(mode="python")
+                    ),
+                    evidence_match=EvidenceMatchResponse(
+                        status=assessment.evidence_match.status,
+                        reason=assessment.evidence_match.reason,
+                        file_path=assessment.evidence_match.file_path,
+                        line_number=assessment.evidence_match.line_number,
+                        location_reason=assessment.evidence_match.location_reason,
+                    ),
+                )
+                for assessment in report.ai_assessments
             ),
         )
 

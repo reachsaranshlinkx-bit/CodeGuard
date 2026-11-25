@@ -1,3 +1,8 @@
+from codeguard.ai.contracts import AIFindingCandidate
+from codeguard.ai.evidence_matching import (
+    EvidenceMatchReason,
+    EvidenceMatchStatus,
+)
 from codeguard.review.comment_models import InlineReviewComment
 from codeguard.review.finding_models import (
     ReviewFinding,
@@ -20,6 +25,27 @@ def _build_comment_body(finding: ReviewFinding) -> str:
         f"**Recommended remediation:**\n"
         f"{finding.remediation}\n\n"
         f"**CWE:** {finding.cwe}"
+    )
+
+
+def _build_ai_comment_body(candidate: AIFindingCandidate) -> str:
+    """Build an actionable comment that keeps an AI candidate unconfirmed."""
+
+    fence = "```"
+    while fence in candidate.evidence:
+        fence += "`"
+
+    return (
+        "**AI review candidate (not a confirmed vulnerability)**\n\n"
+        f"**{candidate.title}**\n\n"
+        f"**Severity:** {candidate.severity} | "
+        f"**Confidence:** {candidate.confidence}\n\n"
+        f"**Problem:**\n{candidate.problem}\n\n"
+        f"**Why it matters:**\n{candidate.why_it_matters}\n\n"
+        "**Evidence excerpt (matched to source; does not confirm the issue):**\n"
+        f"{fence}python\n{candidate.evidence}\n{fence}\n\n"
+        f"**Suggested fix:**\n{candidate.suggested_fix}\n\n"
+        f"**Recommended validation:**\n{candidate.recommended_validation}"
     )
 
 
@@ -78,7 +104,7 @@ def build_inline_review_comments(
             eligible_findings[file_result.file_path] = locations
 
     # Convert only validated report findings into inline comments.
-    comments: list[InlineReviewComment] = []
+    comments: list[tuple[str, int, tuple[str, ...], InlineReviewComment]] = []
 
     ordered_findings = sorted(
         report.findings,
@@ -102,12 +128,80 @@ def build_inline_review_comments(
         ) not in valid_locations:
             continue
 
+        comment = InlineReviewComment(
+            path=finding.file_path,
+            line=finding.line_number,
+            body=_build_comment_body(finding),
+        )
         comments.append(
-            InlineReviewComment(
-                path=finding.file_path,
-                line=finding.line_number,
-                body=_build_comment_body(finding),
+            (
+                finding.file_path,
+                finding.line_number,
+                ("0-static", finding.rule_id, finding.fingerprint),
+                comment,
             )
         )
 
-    return tuple(comments)
+    for assessment in report.ai_assessments:
+        candidate = assessment.candidate
+        evidence_match = assessment.evidence_match
+
+        if (
+            evidence_match.status != EvidenceMatchStatus.MATCHED
+            or evidence_match.reason != EvidenceMatchReason.EXACT_MATCH
+            or evidence_match.file_path != candidate.file_path
+            or evidence_match.line_number != candidate.line_number
+        ):
+            continue
+
+        matching_file = None
+
+        for file_result in analysis.files:
+            if file_result.file_path != candidate.file_path:
+                continue
+
+            if (
+                file_result.ast_result is None
+                or file_result.added_line_numbers is None
+                or file_result.changed_line_findings is None
+                or file_result.line_mapping_error is not None
+                or candidate.line_number not in file_result.added_line_numbers
+            ):
+                continue
+
+            matching_file = file_result
+            break
+
+        if matching_file is None:
+            continue
+
+        comment = InlineReviewComment(
+            path=matching_file.file_path,
+            line=candidate.line_number,
+            body=_build_ai_comment_body(candidate),
+        )
+        comments.append(
+            (
+                matching_file.file_path,
+                candidate.line_number,
+                (
+                    "1-ai",
+                    candidate.title,
+                    candidate.severity,
+                    candidate.confidence,
+                    candidate.problem,
+                    candidate.why_it_matters,
+                    candidate.evidence,
+                    candidate.suggested_fix,
+                    candidate.recommended_validation,
+                ),
+                comment,
+            )
+        )
+
+    ordered_comments = sorted(
+        comments,
+        key=lambda item: (item[0], item[1], item[2]),
+    )
+
+    return tuple(item[3] for item in ordered_comments)
