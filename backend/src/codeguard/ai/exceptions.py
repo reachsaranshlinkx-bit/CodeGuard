@@ -32,6 +32,14 @@ class AIRequestTransmissionState(Enum):
     UNKNOWN = "UNKNOWN"
 
 
+class AIProviderFailureDisposition(Enum):
+    """Whether an AI provider failure may safely trigger a retry."""
+
+    SAFE_TO_RETRY = "SAFE_TO_RETRY"
+    PERMANENT = "PERMANENT"
+    OUTCOME_UNKNOWN = "OUTCOME_UNKNOWN"
+
+
 class AIProviderConfigurationError(AIProviderError):
     """Raised when AI provider configuration is invalid."""
 
@@ -147,3 +155,37 @@ class AIProviderResponseError(AIProviderError):
         super().__init__(message)
         self.status_code = status_code
         self.request_id = request_id
+
+
+def classify_ai_provider_error(
+    error: AIProviderError,
+) -> AIProviderFailureDisposition:
+    """Classify an AI provider failure without assuming retry safety."""
+
+    if isinstance(
+        error,
+        (
+            AIProviderConfigurationError,
+            AIProviderAuthenticationError,
+            AIProviderPermissionError,
+            AIProviderResponseError,
+        ),
+    ):
+        return AIProviderFailureDisposition.PERMANENT
+
+    if isinstance(
+        error,
+        (
+            AIProviderServerError,
+            AIProviderRateLimitError,
+            AIProviderHTTPError,
+        ),
+    ):
+        return AIProviderFailureDisposition.OUTCOME_UNKNOWN
+
+    if isinstance(error, AIProviderRequestError):
+        if error.transmission_state == AIRequestTransmissionState.NOT_SENT:
+            return AIProviderFailureDisposition.SAFE_TO_RETRY
+        return AIProviderFailureDisposition.OUTCOME_UNKNOWN
+
+    return AIProviderFailureDisposition.OUTCOME_UNKNOWN

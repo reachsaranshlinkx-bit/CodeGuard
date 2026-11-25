@@ -4,6 +4,7 @@ from codeguard.ai.exceptions import (
     AIProviderAuthenticationError,
     AIProviderConfigurationError,
     AIProviderError,
+    AIProviderFailureDisposition,
     AIProviderHTTPError,
     AIProviderPermissionError,
     AIProviderRateLimitError,
@@ -12,7 +13,76 @@ from codeguard.ai.exceptions import (
     AIProviderServerError,
     AIProviderTimeoutError,
     AIRequestTransmissionState,
+    classify_ai_provider_error,
 )
+
+
+@pytest.mark.parametrize(
+    ("error", "expected"),
+    [
+        (
+            AIProviderConfigurationError("invalid configuration"),
+            AIProviderFailureDisposition.PERMANENT,
+        ),
+        (
+            AIProviderAuthenticationError("authentication failed", status_code=401),
+            AIProviderFailureDisposition.PERMANENT,
+        ),
+        (
+            AIProviderPermissionError("permission denied", status_code=403),
+            AIProviderFailureDisposition.PERMANENT,
+        ),
+        (
+            AIProviderResponseError("malformed response", status_code=200),
+            AIProviderFailureDisposition.PERMANENT,
+        ),
+        (
+            AIProviderRequestError(
+                "connection failed",
+                transmission_state=AIRequestTransmissionState.NOT_SENT,
+            ),
+            AIProviderFailureDisposition.SAFE_TO_RETRY,
+        ),
+        (
+            AIProviderRequestError(
+                "outcome unknown",
+                transmission_state=AIRequestTransmissionState.UNKNOWN,
+            ),
+            AIProviderFailureDisposition.OUTCOME_UNKNOWN,
+        ),
+        (
+            AIProviderTimeoutError(
+                "pool timeout",
+                transmission_state=AIRequestTransmissionState.NOT_SENT,
+            ),
+            AIProviderFailureDisposition.SAFE_TO_RETRY,
+        ),
+        (
+            AIProviderTimeoutError(
+                "read timeout",
+                transmission_state=AIRequestTransmissionState.UNKNOWN,
+            ),
+            AIProviderFailureDisposition.OUTCOME_UNKNOWN,
+        ),
+        (
+            AIProviderServerError("server failed", status_code=503),
+            AIProviderFailureDisposition.OUTCOME_UNKNOWN,
+        ),
+        (
+            AIProviderRateLimitError("rate limited", status_code=429),
+            AIProviderFailureDisposition.OUTCOME_UNKNOWN,
+        ),
+        (
+            AIProviderHTTPError("HTTP failed", status_code=400),
+            AIProviderFailureDisposition.OUTCOME_UNKNOWN,
+        ),
+    ],
+)
+def test_ai_provider_errors_have_centralized_failure_disposition(
+    error: AIProviderError,
+    expected: AIProviderFailureDisposition,
+) -> None:
+    assert classify_ai_provider_error(error) == expected
 
 
 def test_all_provider_exceptions_inherit_from_base_error() -> None:

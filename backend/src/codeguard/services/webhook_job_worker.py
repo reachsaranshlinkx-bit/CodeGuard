@@ -3,6 +3,11 @@ from __future__ import annotations
 import asyncio
 import logging
 
+from codeguard.ai.exceptions import (
+    AIProviderError,
+    AIProviderFailureDisposition,
+    classify_ai_provider_error,
+)
 from codeguard.services.webhook_review_processor import (
     WebhookReviewProcessor,
 )
@@ -86,9 +91,45 @@ class WebhookJobWorker:
                     repo=job.repo,
                     pull_number=job.pull_number,
                 )
+            except AIProviderError as exc:
+                disposition = classify_ai_provider_error(exc)
+                diagnostic = self._ai_failure_diagnostic(exc, disposition)
+
+                logger.error(
+                    "Webhook review job %s failed: %s",
+                    job.delivery_id,
+                    diagnostic,
+                )
+
+                stop_event.set()
+                await heartbeat_task
+
+                if not lease_lost_event.is_set():
+                    try:
+                        terminal_attempt_limit = (
+                            job.attempts
+                            if disposition != AIProviderFailureDisposition.SAFE_TO_RETRY
+                            else self._max_attempts
+                        )
+                        await asyncio.to_thread(
+                            self._queue.fail_job,
+                            job.delivery_id,
+                            attempt=job.attempts,
+                            error=diagnostic,
+                            retry_delay_seconds=self._retry_delay_seconds,
+                            max_attempts=terminal_attempt_limit,
+                        )
+                    except ValueError:
+                        logger.warning(
+                            "Could not mark job %s as failed because "
+                            "its lease is no longer current.",
+                            job.delivery_id,
+                        )
+
+                return True
             except Exception as exc:
-                logger.exception(
-                    "Webhook review job %s failed.",
+                logger.error(
+                    "Webhook review job %s failed with an ordinary exception.",
                     job.delivery_id,
                 )
 
@@ -142,6 +183,34 @@ class WebhookJobWorker:
         finally:
             stop_event.set()
             await heartbeat_task
+
+    @staticmethod
+    def _ai_failure_diagnostic(
+        error: AIProviderError,
+        disposition: AIProviderFailureDisposition,
+    ) -> str:
+        """Build a bounded diagnostic without provider or transport details."""
+
+        parts = [
+            f"disposition={disposition.value}",
+            f"AI_exception={type(error).__name__}",
+        ]
+
+        status_code = getattr(error, "status_code", None)
+        if isinstance(status_code, int) and not isinstance(status_code, bool):
+            parts.append(f"status={status_code}")
+
+        request_id = getattr(error, "request_id", None)
+        if isinstance(request_id, str) and request_id.strip():
+            safe_request_id = "".join(
+                character
+                if character.isprintable() and character not in "\r\n"
+                else "_"
+                for character in request_id.strip()
+            )[:200]
+            parts.append(f"request_id={safe_request_id}")
+
+        return " ".join(parts)
 
     async def _maintain_lease(
         self,

@@ -1,8 +1,19 @@
+import logging
 from pathlib import Path
 from unittest.mock import AsyncMock
 
 import pytest
 
+from codeguard.ai.exceptions import (
+    AIProviderAuthenticationError,
+    AIProviderHTTPError,
+    AIProviderPermissionError,
+    AIProviderRateLimitError,
+    AIProviderRequestError,
+    AIProviderResponseError,
+    AIProviderServerError,
+    AIRequestTransmissionState,
+)
 from codeguard.services.webhook_job_worker import WebhookJobWorker
 from codeguard.webhooks.job_queue import WebhookJobQueue
 
@@ -122,3 +133,125 @@ async def test_run_once_permanently_fails_after_maximum_attempts(
     assert saved.attempts == 1
     assert saved.lease_expires_at is None
     assert saved.last_error == "Permanent processing failure"
+
+
+async def test_not_sent_ai_failure_uses_existing_bounded_retry(
+    queue: WebhookJobQueue,
+) -> None:
+    enqueue_test_job(queue)
+    processor = AsyncMock()
+    processor.process.side_effect = AIProviderRequestError(
+        "pool unavailable",
+        transmission_state=AIRequestTransmissionState.NOT_SENT,
+    )
+
+    worker = WebhookJobWorker(
+        queue=queue,
+        processor=processor,
+        retry_delay_seconds=0,
+        max_attempts=3,
+    )
+
+    await worker.run_once()
+    saved = queue.get_job("delivery-worker-001")
+
+    assert saved is not None
+    assert saved.status == "queued"
+    assert saved.attempts == 1
+    assert "disposition=SAFE_TO_RETRY" in (saved.last_error or "")
+    assert "AIProviderRequestError" in (saved.last_error or "")
+
+
+@pytest.mark.parametrize(
+    "provider_error",
+    [
+        AIProviderRequestError(
+            "outcome unknown",
+            transmission_state=AIRequestTransmissionState.UNKNOWN,
+        ),
+        AIProviderAuthenticationError("authentication failed", status_code=401),
+        AIProviderPermissionError("permission denied", status_code=403),
+        AIProviderResponseError("malformed response", status_code=200),
+        AIProviderRateLimitError("rate limited", status_code=429),
+        AIProviderServerError("server failed", status_code=503),
+        AIProviderHTTPError("bad request", status_code=400),
+    ],
+)
+async def test_uncertain_or_permanent_ai_failures_are_terminal(
+    queue: WebhookJobQueue,
+    provider_error: Exception,
+) -> None:
+    enqueue_test_job(queue)
+    processor = AsyncMock()
+    processor.process.side_effect = provider_error
+
+    worker = WebhookJobWorker(
+        queue=queue,
+        processor=processor,
+        retry_delay_seconds=0,
+        max_attempts=5,
+    )
+
+    await worker.run_once()
+    saved = queue.get_job("delivery-worker-001")
+
+    assert saved is not None
+    assert saved.status == "failed"
+    assert saved.attempts == 1
+    assert "disposition=" in (saved.last_error or "")
+    assert type(provider_error).__name__ in (saved.last_error or "")
+
+
+async def test_ai_diagnostic_preserves_safe_metadata_and_hides_sensitive_chain(
+    queue: WebhookJobQueue,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    enqueue_test_job(queue)
+    secret = "private-api-key-and-transport-detail"
+    provider_error = AIProviderServerError(
+        "safe public message",
+        status_code=503,
+        request_id="provider-request-456",
+    )
+    provider_error.__cause__ = RuntimeError(secret)
+    processor = AsyncMock()
+    processor.process.side_effect = provider_error
+
+    worker = WebhookJobWorker(queue=queue, processor=processor)
+
+    with caplog.at_level(logging.WARNING):
+        await worker.run_once()
+
+    saved = queue.get_job("delivery-worker-001")
+    assert saved is not None
+    assert "disposition=OUTCOME_UNKNOWN" in (saved.last_error or "")
+    assert "AIProviderServerError" in (saved.last_error or "")
+    assert "status=503" in (saved.last_error or "")
+    assert "request_id=provider-request-456" in (saved.last_error or "")
+    assert secret not in (saved.last_error or "")
+    assert secret not in caplog.text
+
+
+async def test_not_sent_ai_failure_respects_maximum_attempts(
+    queue: WebhookJobQueue,
+) -> None:
+    enqueue_test_job(queue)
+    processor = AsyncMock()
+    processor.process.side_effect = AIProviderRequestError(
+        "pool unavailable",
+        transmission_state=AIRequestTransmissionState.NOT_SENT,
+    )
+
+    worker = WebhookJobWorker(
+        queue=queue,
+        processor=processor,
+        retry_delay_seconds=0,
+        max_attempts=1,
+    )
+
+    await worker.run_once()
+    saved = queue.get_job("delivery-worker-001")
+
+    assert saved is not None
+    assert saved.status == "failed"
+    assert saved.attempts == 1
