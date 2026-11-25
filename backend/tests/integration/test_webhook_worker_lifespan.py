@@ -3,9 +3,14 @@ import time
 from pathlib import Path
 from threading import Event
 
+import pytest
 from fastapi.testclient import TestClient
 
 import codeguard.main as main
+from codeguard.ai.engine import AIReviewEngine
+from codeguard.ai.exceptions import AIProviderConfigurationError
+from codeguard.ai.factory import create_ai_review_provider
+from codeguard.ai.mock_provider import MockAIReviewProvider
 from codeguard.context.repository_context_builder import (
     RepositoryContextBuilder,
 )
@@ -28,15 +33,26 @@ def test_worker_remains_disabled_by_default(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
+    provider_factory_calls = []
+
     def unexpected_client_creation(
         token: str | None = None,
     ) -> FakeGitHubClient:
         raise AssertionError("GitHub client should not be created.")
 
+    def record_provider_factory(settings: Settings) -> None:
+        provider_factory_calls.append(settings)
+
     monkeypatch.setattr(
         main,
         "GitHubClient",
         unexpected_client_creation,
+    )
+    monkeypatch.setattr(
+        main,
+        "create_ai_review_provider",
+        record_provider_factory,
+        raising=False,
     )
 
     settings = Settings(
@@ -48,6 +64,79 @@ def test_worker_remains_disabled_by_default(
 
     with TestClient(app):
         assert app.state.webhook_worker is None
+        assert provider_factory_calls == []
+
+
+def test_mock_provider_is_injected_into_analyzer(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    created_clients: list[FakeGitHubClient] = []
+    analyzers = []
+    provider_factory_settings = []
+    worker_started = Event()
+
+    def fake_client_factory(
+        token: str | None = None,
+    ) -> FakeGitHubClient:
+        client = FakeGitHubClient(token=token)
+        created_clients.append(client)
+        return client
+
+    async def fake_worker_loop(
+        *,
+        worker,
+        poll_interval_seconds: int,
+        stop_event,
+    ) -> None:
+        worker_started.set()
+        await stop_event.wait()
+
+    class CapturingReviewProcessor:
+        def __init__(
+            self,
+            *,
+            analyzer,
+            github_client,
+            publishing_enabled: bool,
+        ) -> None:
+            analyzers.append(analyzer)
+
+    def provider_factory_spy(settings: Settings):
+        provider_factory_settings.append(settings)
+        return create_ai_review_provider(settings)
+
+    monkeypatch.setattr(main, "GitHubClient", fake_client_factory)
+    monkeypatch.setattr(main, "run_webhook_worker", fake_worker_loop)
+    monkeypatch.setattr(main, "WebhookReviewProcessor", CapturingReviewProcessor)
+    monkeypatch.setattr(
+        main,
+        "create_ai_review_provider",
+        provider_factory_spy,
+        raising=False,
+    )
+
+    settings = Settings(
+        _env_file=None,
+        environment="testing",
+        ai_provider="mock",
+        webhook_worker_enabled=True,
+        webhook_database_path=tmp_path / "mock-provider.sqlite3",
+    )
+    app = main.create_app(settings=settings)
+
+    with TestClient(app):
+        assert worker_started.wait(timeout=2)
+        assert len(analyzers) == 1
+        assert isinstance(analyzers[0]._ai_review_engine, AIReviewEngine)
+        assert isinstance(
+            analyzers[0]._ai_review_engine._provider,
+            MockAIReviewProvider,
+        )
+        assert provider_factory_settings == [settings]
+
+    assert len(created_clients) == 1
+    assert created_clients[0].closed is True
 
 
 def test_enabled_worker_starts_and_shuts_down_cleanly(
@@ -226,6 +315,7 @@ def test_enabled_lifespan_processes_queued_job(
             processor.analyzer._repository_context_builder,
             RepositoryContextBuilder,
         )
+        assert processor.analyzer._ai_review_engine is None
 
         assert (
             processor.analyzer._repository_context_builder._github_client
@@ -256,6 +346,87 @@ def test_enabled_lifespan_processes_queued_job(
         assert saved.lease_expires_at is None
 
         assert app.state.webhook_worker is not None
+
+    assert len(created_clients) == 1
+    assert created_clients[0].closed is True
+
+
+def test_github_client_is_closed_if_provider_creation_fails(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    created_clients: list[FakeGitHubClient] = []
+
+    def fake_client_factory(
+        token: str | None = None,
+    ) -> FakeGitHubClient:
+        client = FakeGitHubClient(token=token)
+        created_clients.append(client)
+        return client
+
+    def failing_provider_factory(settings: Settings):
+        raise RuntimeError("provider construction failed")
+
+    monkeypatch.setattr(main, "GitHubClient", fake_client_factory)
+    monkeypatch.setattr(
+        main,
+        "create_ai_review_provider",
+        failing_provider_factory,
+        raising=False,
+    )
+
+    settings = Settings(
+        _env_file=None,
+        webhook_worker_enabled=True,
+        webhook_database_path=tmp_path / "provider-failure.sqlite3",
+    )
+    app = main.create_app(settings=settings)
+
+    with pytest.raises(RuntimeError, match="provider construction failed"):
+        with TestClient(app):
+            pass
+
+    assert len(created_clients) == 1
+    assert created_clients[0].closed is True
+
+
+@pytest.mark.parametrize("environment", ["staging", "production"])
+def test_mock_provider_cannot_start_in_staging_or_production(
+    environment: str,
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    created_clients: list[FakeGitHubClient] = []
+
+    def fake_client_factory(
+        token: str | None = None,
+    ) -> FakeGitHubClient:
+        client = FakeGitHubClient(token=token)
+        created_clients.append(client)
+        return client
+
+    async def fake_worker_loop(
+        *,
+        worker,
+        poll_interval_seconds: int,
+        stop_event,
+    ) -> None:
+        await stop_event.wait()
+
+    monkeypatch.setattr(main, "GitHubClient", fake_client_factory)
+    monkeypatch.setattr(main, "run_webhook_worker", fake_worker_loop)
+
+    settings = Settings.model_construct(
+        environment=environment,
+        ai_provider="mock",
+        webhook_worker_enabled=True,
+        webhook_database_path=tmp_path / f"{environment}-mock.sqlite3",
+    )
+    app = main.create_app(settings=settings)
+
+    with pytest.raises(AIProviderConfigurationError):
+        with TestClient(app):
+            pass
 
     assert len(created_clients) == 1
     assert created_clients[0].closed is True

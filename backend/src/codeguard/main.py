@@ -5,6 +5,8 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
+from codeguard.ai.engine import AIReviewEngine
+from codeguard.ai.factory import create_ai_review_provider
 from codeguard.api.v1.health import router as health_router
 from codeguard.api.v1.reviews import router as reviews_router
 from codeguard.api.v1.webhooks import router as webhooks_router
@@ -77,11 +79,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         stop_event = asyncio.Event()
 
         try:
+            provider = create_ai_review_provider(app_settings)
+            ai_review_engine = (
+                AIReviewEngine(provider) if provider is not None else None
+            )
+
             analyzer = PullRequestAnalyzer(
                 github_client=github_client,
                 repository_context_builder=RepositoryContextBuilder(
                     github_client,
                 ),
+                ai_review_engine=ai_review_engine,
             )
 
             processor = WebhookReviewProcessor(
