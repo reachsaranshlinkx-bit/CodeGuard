@@ -11,6 +11,7 @@ from codeguard.ai.exceptions import (
     AIProviderResponseError,
     AIProviderServerError,
     AIProviderTimeoutError,
+    AIRequestTransmissionState,
 )
 
 
@@ -78,6 +79,28 @@ def test_timeout_is_distinct_from_other_transport_errors() -> None:
     assert isinstance(timeout_error, AIProviderRequestError)
     assert isinstance(timeout_error, AIProviderError)
     assert not isinstance(request_error, AIProviderTimeoutError)
+
+
+def test_request_exceptions_default_to_unknown_transmission_state() -> None:
+    request_error = AIProviderRequestError("Provider connection failed.")
+    timeout_error = AIProviderTimeoutError("Provider request timed out.")
+
+    assert request_error.transmission_state == AIRequestTransmissionState.UNKNOWN
+    assert timeout_error.transmission_state == AIRequestTransmissionState.UNKNOWN
+
+
+def test_request_exceptions_preserve_explicit_transmission_state() -> None:
+    request_error = AIProviderRequestError(
+        "Provider connection failed.",
+        transmission_state=AIRequestTransmissionState.NOT_SENT,
+    )
+    timeout_error = AIProviderTimeoutError(
+        "Provider request timed out.",
+        transmission_state=AIRequestTransmissionState.NOT_SENT,
+    )
+
+    assert request_error.transmission_state == AIRequestTransmissionState.NOT_SENT
+    assert timeout_error.transmission_state == AIRequestTransmissionState.NOT_SENT
 
 
 def test_response_error_can_preserve_optional_http_status() -> None:

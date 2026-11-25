@@ -19,6 +19,7 @@ from codeguard.ai.exceptions import (
     AIProviderResponseError,
     AIProviderServerError,
     AIProviderTimeoutError,
+    AIRequestTransmissionState,
 )
 
 
@@ -152,10 +153,31 @@ class AIProviderHTTPClient:
 
         try:
             response = await self._client.post(path, json=payload)
+        except httpx.PoolTimeout as exc:
+            raise AIProviderTimeoutError(
+                "AI provider request timed out.",
+                transmission_state=AIRequestTransmissionState.NOT_SENT,
+            ) from exc
+        except httpx.ConnectTimeout as exc:
+            raise AIProviderTimeoutError(
+                "AI provider request timed out.",
+                transmission_state=AIRequestTransmissionState.NOT_SENT,
+            ) from exc
+        except httpx.ConnectError as exc:
+            raise AIProviderRequestError(
+                "AI provider request failed.",
+                transmission_state=AIRequestTransmissionState.NOT_SENT,
+            ) from exc
         except httpx.TimeoutException as exc:
-            raise AIProviderTimeoutError("AI provider request timed out.") from exc
+            raise AIProviderTimeoutError(
+                "AI provider request timed out.",
+                transmission_state=AIRequestTransmissionState.UNKNOWN,
+            ) from exc
         except httpx.RequestError as exc:
-            raise AIProviderRequestError("AI provider request failed.") from exc
+            raise AIProviderRequestError(
+                "AI provider request failed.",
+                transmission_state=AIRequestTransmissionState.UNKNOWN,
+            ) from exc
 
         self._raise_for_status(response)
 

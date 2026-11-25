@@ -1,4 +1,5 @@
 import math
+from enum import Enum
 
 
 def _validate_status_code(status_code: int) -> None:
@@ -24,12 +25,35 @@ class AIProviderError(Exception):
         super().__init__(message)
 
 
+class AIRequestTransmissionState(Enum):
+    """Whether an AI provider HTTP request is known to have been sent."""
+
+    NOT_SENT = "NOT_SENT"
+    UNKNOWN = "UNKNOWN"
+
+
 class AIProviderConfigurationError(AIProviderError):
     """Raised when AI provider configuration is invalid."""
 
 
 class AIProviderRequestError(AIProviderError):
     """Raised when an AI provider request fails."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        transmission_state: AIRequestTransmissionState = (
+            AIRequestTransmissionState.UNKNOWN
+        ),
+    ) -> None:
+        if not isinstance(transmission_state, AIRequestTransmissionState):
+            raise ValueError(
+                "Transmission state must be an AIRequestTransmissionState."
+            )
+
+        super().__init__(message)
+        self.transmission_state = transmission_state
 
 
 class AIProviderTimeoutError(AIProviderRequestError):
@@ -45,11 +69,14 @@ class AIProviderHTTPError(AIProviderRequestError):
         *,
         status_code: int,
         request_id: str | None = None,
+        transmission_state: AIRequestTransmissionState = (
+            AIRequestTransmissionState.UNKNOWN
+        ),
     ) -> None:
         _validate_status_code(status_code)
         _validate_request_id(request_id)
 
-        super().__init__(message)
+        super().__init__(message, transmission_state=transmission_state)
         self.status_code = status_code
         self.request_id = request_id
 
@@ -72,6 +99,9 @@ class AIProviderRateLimitError(AIProviderHTTPError):
         status_code: int,
         request_id: str | None = None,
         retry_after: float | None = None,
+        transmission_state: AIRequestTransmissionState = (
+            AIRequestTransmissionState.UNKNOWN
+        ),
     ) -> None:
         if retry_after is not None:
             if isinstance(retry_after, bool) or not isinstance(
@@ -91,6 +121,7 @@ class AIProviderRateLimitError(AIProviderHTTPError):
             message,
             status_code=status_code,
             request_id=request_id,
+            transmission_state=transmission_state,
         )
         self.retry_after = float(retry_after) if retry_after is not None else None
 

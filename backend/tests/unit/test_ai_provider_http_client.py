@@ -1,4 +1,6 @@
+import asyncio
 import json
+from collections.abc import Callable
 
 import httpx
 import pytest
@@ -13,6 +15,7 @@ from codeguard.ai.exceptions import (
     AIProviderResponseError,
     AIProviderServerError,
     AIProviderTimeoutError,
+    AIRequestTransmissionState,
 )
 from codeguard.ai.http_client import AIProviderHTTPClient
 
@@ -210,6 +213,76 @@ async def test_timeout_errors_are_mapped_without_exposing_transport_details() ->
             await client.post_json("reviews", {})
 
     assert secret not in str(exc_info.value)
+
+
+@pytest.mark.parametrize(
+    ("exception_factory", "expected_state", "expected_error"),
+    [
+        (
+            lambda request: httpx.PoolTimeout("pool timeout", request=request),
+            AIRequestTransmissionState.NOT_SENT,
+            AIProviderTimeoutError,
+        ),
+        (
+            lambda request: httpx.ConnectTimeout("connect timeout", request=request),
+            AIRequestTransmissionState.NOT_SENT,
+            AIProviderTimeoutError,
+        ),
+        (
+            lambda request: httpx.ConnectError("connect failure", request=request),
+            AIRequestTransmissionState.NOT_SENT,
+            AIProviderRequestError,
+        ),
+        (
+            lambda request: httpx.ReadTimeout("read timeout", request=request),
+            AIRequestTransmissionState.UNKNOWN,
+            AIProviderTimeoutError,
+        ),
+        (
+            lambda request: httpx.WriteTimeout("write timeout", request=request),
+            AIRequestTransmissionState.UNKNOWN,
+            AIProviderTimeoutError,
+        ),
+        (
+            lambda request: httpx.TimeoutException("generic timeout", request=request),
+            AIRequestTransmissionState.UNKNOWN,
+            AIProviderTimeoutError,
+        ),
+        (
+            lambda request: httpx.RequestError("other request error", request=request),
+            AIRequestTransmissionState.UNKNOWN,
+            AIProviderRequestError,
+        ),
+    ],
+)
+async def test_transport_failures_preserve_conservative_transmission_state(
+    exception_factory: Callable[[httpx.Request], Exception],
+    expected_state: AIRequestTransmissionState,
+    expected_error: type[BaseException],
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise exception_factory(request)
+
+    async with AIProviderHTTPClient(
+        "https://provider.example",
+        transport=httpx.MockTransport(handler),
+    ) as client:
+        with pytest.raises(expected_error) as exc_info:
+            await client.post_json("reviews", {})
+
+    assert exc_info.value.transmission_state == expected_state
+
+
+async def test_cancellation_is_not_converted_to_provider_error() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise asyncio.CancelledError
+
+    async with AIProviderHTTPClient(
+        "https://provider.example",
+        transport=httpx.MockTransport(handler),
+    ) as client:
+        with pytest.raises(asyncio.CancelledError):
+            await client.post_json("reviews", {})
 
 
 async def test_other_network_errors_are_mapped_without_details() -> None:
