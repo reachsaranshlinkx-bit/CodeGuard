@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal
 
+from codeguard.ai.engine import AIReviewFindingAssessment
+
 Severity = Literal["critical", "high", "medium", "low", "info"]
 
 Confidence = Literal["low", "medium", "high"]
@@ -108,6 +110,8 @@ class ReviewReport:
     findings: tuple[ReviewFinding, ...]
     files_analyzed: int
     files_with_unavailable_mapping: tuple[str, ...] = ()
+    ai_review_summary: str | None = None
+    ai_assessments: tuple[AIReviewFindingAssessment, ...] = ()
 
     def __post_init__(self) -> None:
         """Validate report metadata."""

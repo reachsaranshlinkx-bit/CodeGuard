@@ -1,9 +1,20 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Any
 
 import pytest
 
+from codeguard.ai.contracts import AIFindingCandidate, AIReviewResult
+from codeguard.ai.engine import (
+    AIReviewExecutionResult,
+    AIReviewFindingAssessment,
+)
+from codeguard.ai.evidence_matching import (
+    EvidenceMatchReason,
+    EvidenceMatchResult,
+    EvidenceMatchStatus,
+)
 from codeguard.github.exceptions import GitHubPermissionError
 from codeguard.github.schemas import (
     GitHubPullRequest,
@@ -367,3 +378,82 @@ async def test_end_to_end_pipeline_never_comments_without_patch_mapping() -> Non
 
     assert client.review_lookup_calls == 0
     assert client.created_reviews == []
+
+
+@pytest.mark.asyncio
+async def test_ai_assessment_flows_through_report_mapper_and_publisher() -> None:
+    safe_source = "def authenticate(value):\n    return str(value)\n"
+    safe_patch = (
+        "@@ -1,2 +1,2 @@\n"
+        " def authenticate(value):\n"
+        "-    return value\n"
+        "+    return str(value)\n"
+    )
+    client = FakeGitHubClient(
+        source=safe_source,
+        changed_file=make_file(
+            patch=safe_patch,
+            additions=1,
+            deletions=1,
+        ),
+    )
+    analysis, _ = await run_analysis(client)
+    candidate = AIFindingCandidate(
+        title="Potential unsafe value handling",
+        severity="medium",
+        confidence="medium",
+        file_path="src/auth.py",
+        line_number=2,
+        problem="The returned value may not be validated for the caller.",
+        evidence="    return str(value)",
+        why_it_matters="Unexpected values may be accepted by downstream code.",
+        suggested_fix="Validate the value against the expected format.",
+        recommended_validation="Add tests for malformed values.",
+    )
+    assessment = AIReviewFindingAssessment(
+        candidate=candidate,
+        evidence_match=EvidenceMatchResult(
+            status=EvidenceMatchStatus.MATCHED,
+            reason=EvidenceMatchReason.EXACT_MATCH,
+            file_path=candidate.file_path,
+            line_number=candidate.line_number,
+        ),
+    )
+    analysis = replace(
+        analysis,
+        ai_review_result=AIReviewExecutionResult(
+            provider_result=AIReviewResult(
+                summary="One potential issue was assessed.",
+                findings=(candidate,),
+            ),
+            assessments=(assessment,),
+        ),
+    )
+    report = build_review_report(analysis)
+
+    result = await ReviewPublisher(
+        github_client=client,
+        dry_run=False,
+    ).publish(
+        report,
+        analysis,
+    )
+
+    assert report.findings == ()
+    assert report.ai_assessments == (assessment,)
+    assert analysis.files[0].changed_line_findings == ()
+    assert result.status == "published"
+    assert result.comment_count == 1
+    assert result.comments[0].path == "src/auth.py"
+    assert result.comments[0].line == 2
+    assert candidate.title in result.comments[0].body
+    assert client.review_lookup_calls == 1
+    assert len(client.created_reviews) == 1
+    assert client.created_reviews[0]["comments"] == [
+        {
+            "path": "src/auth.py",
+            "line": 2,
+            "side": "RIGHT",
+            "body": result.comments[0].body,
+        }
+    ]

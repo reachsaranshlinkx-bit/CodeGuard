@@ -1,7 +1,23 @@
-from typing import Literal, Self
+from typing import Annotated, Literal, Self
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StringConstraints,
+    model_validator,
+)
 
+from codeguard.ai.contracts import (
+    AIConfidence,
+    AIFindingCandidate,
+    AISeverity,
+)
+from codeguard.ai.evidence_matching import (
+    EvidenceMatchReason,
+    EvidenceMatchStatus,
+)
+from codeguard.ai.evidence_validation import EvidenceLocationReason
 from codeguard.review.finding_models import Confidence, Severity
 
 
@@ -46,6 +62,63 @@ class ReviewFindingResponse(BaseModel):
     remediation: str = Field(min_length=1)
 
     references: tuple[str, ...] = Field(min_length=1)
+
+
+class AIFindingCandidateResponse(BaseModel):
+    """API representation of one AI-proposed finding candidate."""
+
+    model_config = ConfigDict(
+        extra="forbid",
+        str_strip_whitespace=True,
+    )
+
+    title: str = Field(min_length=1, max_length=200)
+    severity: AISeverity
+    confidence: AIConfidence
+    file_path: str = Field(min_length=1, max_length=500)
+    line_number: int = Field(gt=0, strict=True)
+    problem: str = Field(min_length=1, max_length=3000)
+    evidence: Annotated[
+        str,
+        StringConstraints(strip_whitespace=False),
+    ] = Field(min_length=1, max_length=4000)
+    why_it_matters: str = Field(min_length=1, max_length=2000)
+    suggested_fix: str = Field(min_length=1, max_length=3000)
+    recommended_validation: str = Field(min_length=1, max_length=2000)
+
+    @model_validator(mode="after")
+    def validate_candidate_contract(self) -> Self:
+        """Apply the domain candidate's path and evidence validation."""
+
+        AIFindingCandidate.model_validate(self.model_dump(mode="python"))
+        return self
+
+
+class EvidenceMatchResponse(BaseModel):
+    """API representation of an AI candidate's evidence assessment."""
+
+    model_config = ConfigDict(
+        extra="forbid",
+        str_strip_whitespace=True,
+    )
+
+    status: EvidenceMatchStatus
+    reason: EvidenceMatchReason
+    file_path: str = Field(min_length=1)
+    line_number: int = Field(gt=0, strict=True)
+    location_reason: EvidenceLocationReason | None = None
+
+
+class AIReviewAssessmentResponse(BaseModel):
+    """API representation of an AI candidate and its evidence assessment."""
+
+    model_config = ConfigDict(
+        extra="forbid",
+        str_strip_whitespace=True,
+    )
+
+    candidate: AIFindingCandidateResponse
+    evidence_match: EvidenceMatchResponse
 
 
 class SeverityCountsResponse(BaseModel):
@@ -131,6 +204,8 @@ class ReviewResponse(BaseModel):
 
     severity_counts: SeverityCountsResponse
     repository_context: RepositoryContextResponse | None = None
+    ai_review_summary: str | None = None
+    ai_assessments: tuple[AIReviewAssessmentResponse, ...] = ()
 
     @model_validator(mode="after")
     def validate_report_counts(self) -> Self:

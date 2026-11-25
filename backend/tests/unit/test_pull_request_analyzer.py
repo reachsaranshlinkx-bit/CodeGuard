@@ -1,10 +1,19 @@
 import pytest
 
+from codeguard.ai.context_builder import AIReviewContextBuilder
+from codeguard.ai.contracts import AIReviewInput, AIReviewResult
+from codeguard.ai.engine import AIReviewEngine, AIReviewExecutionResult
+from codeguard.ai.mock_provider import MockAIReviewProvider
 from codeguard.analyzers.python_ast import (
     PythonAnalysisResult,
     PythonASTAnalyzer,
 )
 from codeguard.context.file_discovery import DiscoveredPythonFile
+from codeguard.context.source_snapshot import (
+    RepositoryContextBuildResult,
+    RepositorySourceFile,
+    RepositorySourceSnapshot,
+)
 from codeguard.context.symbols import (
     FileSymbolIndex,
     RepositoryFileFailure,
@@ -145,6 +154,133 @@ class FakeRepositoryContextBuilder:
     ) -> RepositorySymbolIndex:
         self.calls.append((owner, repo, commit_sha))
         return self.result
+
+
+class FakeSnapshotAwareRepositoryContextBuilder:
+    """Fake that exposes both the legacy and source-snapshot build methods."""
+
+    def __init__(self, result: RepositoryContextBuildResult) -> None:
+        self.result = result
+        self.build_calls: list[tuple[str, str, str]] = []
+        self.build_with_source_calls: list[tuple[str, str, str]] = []
+
+    async def build(
+        self,
+        owner: str,
+        repo: str,
+        commit_sha: str,
+    ) -> RepositorySymbolIndex:
+        self.build_calls.append((owner, repo, commit_sha))
+        return self.result.symbol_index
+
+    async def build_with_source(
+        self,
+        owner: str,
+        repo: str,
+        commit_sha: str,
+    ) -> RepositoryContextBuildResult:
+        self.build_with_source_calls.append((owner, repo, commit_sha))
+        return self.result
+
+
+class RecordingAIReviewEngine(AIReviewEngine):
+    """Capture the exact input and snapshot passed through the real engine."""
+
+    def __init__(self, provider: MockAIReviewProvider) -> None:
+        super().__init__(provider)
+        self.review_calls: list[tuple[AIReviewInput, RepositorySourceSnapshot]] = []
+        self.execution_results: list[AIReviewExecutionResult] = []
+
+    async def review(
+        self,
+        review_input: AIReviewInput,
+        source_snapshot: RepositorySourceSnapshot,
+    ) -> AIReviewExecutionResult:
+        self.review_calls.append((review_input, source_snapshot))
+        result = await super().review(review_input, source_snapshot)
+        self.execution_results.append(result)
+        return result
+
+
+def make_repository_context_build_result(
+    sources: dict[str, str],
+) -> RepositoryContextBuildResult:
+    ast_analyzer = PythonASTAnalyzer()
+    symbol_files: list[FileSymbolIndex] = []
+    source_files: list[RepositorySourceFile] = []
+
+    for path, source in sources.items():
+        discovered_file = DiscoveredPythonFile(
+            path=path,
+            sha="c" * 40,
+            size_bytes=len(source.encode("utf-8")),
+        )
+        symbol_files.append(
+            FileSymbolIndex(
+                discovered_file=discovered_file,
+                analysis=ast_analyzer.analyze(source, file_path=path),
+            )
+        )
+        source_files.append(
+            RepositorySourceFile(
+                discovered_file=discovered_file,
+                source=source,
+            )
+        )
+
+    commit_sha = "b" * 40
+    symbol_index = RepositorySymbolIndex(
+        commit_sha=commit_sha,
+        files=tuple(symbol_files),
+    )
+    source_snapshot = RepositorySourceSnapshot(
+        commit_sha=commit_sha,
+        files=tuple(source_files),
+    )
+
+    return RepositoryContextBuildResult(
+        symbol_index=symbol_index,
+        source_snapshot=source_snapshot,
+    )
+
+
+def make_ai_integration_client() -> FakeGitHubClient:
+    auth_source = "def authenticate(token):\n    return eval(token)\n"
+    patch = (
+        "@@ -1,2 +1,2 @@\n"
+        " def authenticate(token):\n"
+        "-    return token\n"
+        "+    return eval(token)\n"
+    )
+
+    return FakeGitHubClient(
+        files=[
+            make_file(
+                "src/auth.py",
+                additions=1,
+                deletions=1,
+                patch=patch,
+            )
+        ],
+        contents={"src/auth.py": auth_source},
+    )
+
+
+def make_ai_integration_context() -> RepositoryContextBuildResult:
+    return make_repository_context_build_result(
+        {
+            "src/auth.py": "def authenticate(token):\n    return eval(token)\n",
+            "src/views.py": (
+                "from src.auth import authenticate\n"
+                "\n"
+                "def login(token):\n"
+                "    return authenticate(token)\n"
+            ),
+            "src/unrelated.py": (
+                "UNRELATED_REPOSITORY_SENTINEL = 'must not enter AI context'\n"
+            ),
+        }
+    )
 
 
 @pytest.mark.asyncio
@@ -1264,3 +1400,118 @@ async def test_analyzer_resolves_imports_from_src_layout_packages() -> None:
     ] == [
         ("src/codeguard/views.py", "login", "authenticate", 4),
     ]
+
+
+@pytest.mark.asyncio
+async def test_analyzer_keeps_static_behavior_when_ai_is_disabled() -> None:
+    repository_context = make_ai_integration_context()
+    context_builder = FakeSnapshotAwareRepositoryContextBuilder(repository_context)
+    analyzer = PullRequestAnalyzer(
+        github_client=make_ai_integration_client(),
+        repository_context_builder=context_builder,
+    )
+
+    result = await analyzer.analyze("octocat", "CodeGuard", 42)
+
+    assert context_builder.build_calls == [
+        ("octocat", "CodeGuard", "b" * 40),
+    ]
+    assert context_builder.build_with_source_calls == []
+    assert result.repository_context is repository_context.symbol_index
+    assert len(result.files) == 1
+    assert result.files[0].risk_findings
+
+
+@pytest.mark.asyncio
+async def test_analyzer_runs_ai_and_preserves_static_results() -> None:
+    repository_context = make_ai_integration_context()
+
+    baseline_context_builder = FakeSnapshotAwareRepositoryContextBuilder(
+        repository_context
+    )
+    baseline = await PullRequestAnalyzer(
+        github_client=make_ai_integration_client(),
+        repository_context_builder=baseline_context_builder,
+    ).analyze("octocat", "CodeGuard", 42)
+
+    context_builder = FakeSnapshotAwareRepositoryContextBuilder(repository_context)
+    provider_result = AIReviewResult(
+        summary="Mock integration review completed.",
+    )
+    provider = MockAIReviewProvider(result=provider_result)
+    engine = RecordingAIReviewEngine(provider)
+    result = await PullRequestAnalyzer(
+        github_client=make_ai_integration_client(),
+        repository_context_builder=context_builder,
+        ai_review_engine=engine,
+        ai_review_context_builder=AIReviewContextBuilder(),
+    ).analyze("octocat", "CodeGuard", 42)
+
+    assert context_builder.build_calls == []
+    assert context_builder.build_with_source_calls == [
+        ("octocat", "CodeGuard", "b" * 40),
+    ]
+    assert result.repository_context is repository_context.symbol_index
+    assert result.files == baseline.files
+
+    assert len(engine.review_calls) == 1
+    review_input, received_snapshot = engine.review_calls[0]
+    assert isinstance(review_input, AIReviewInput)
+    assert review_input.owner == "octocat"
+    assert review_input.repo == "CodeGuard"
+    assert review_input.pull_number == 42
+    assert review_input.head_sha == "b" * 40
+    assert len(review_input.context) <= 50_000
+    assert "def authenticate(token):\n    return eval(token)\n" in review_input.context
+    assert "def login(token):\n    return authenticate(token)" in review_input.context
+    assert "UNRELATED_REPOSITORY_SENTINEL" not in review_input.context
+    assert received_snapshot is repository_context.source_snapshot
+    assert provider.reviewed_inputs == (review_input,)
+
+    assert len(engine.execution_results) == 1
+    assert result.ai_review_result is engine.execution_results[0]
+    assert isinstance(result.ai_review_result, AIReviewExecutionResult)
+    assert result.ai_review_result.provider_result == provider_result
+
+
+@pytest.mark.asyncio
+async def test_analyzer_skips_ai_when_no_relevant_source_is_available() -> None:
+    repository_context = make_repository_context_build_result({})
+    context_builder = FakeSnapshotAwareRepositoryContextBuilder(repository_context)
+    provider = MockAIReviewProvider()
+    engine = RecordingAIReviewEngine(provider)
+    analyzer = PullRequestAnalyzer(
+        github_client=make_ai_integration_client(),
+        repository_context_builder=context_builder,
+        ai_review_engine=engine,
+        ai_review_context_builder=AIReviewContextBuilder(),
+    )
+
+    result = await analyzer.analyze("octocat", "CodeGuard", 42)
+
+    assert context_builder.build_with_source_calls == [
+        ("octocat", "CodeGuard", "b" * 40),
+    ]
+    assert provider.reviewed_inputs == ()
+    assert engine.review_calls == []
+    assert result.ai_review_result is None
+
+
+@pytest.mark.asyncio
+async def test_analyzer_propagates_ai_provider_exceptions() -> None:
+    repository_context = make_ai_integration_context()
+    provider_error = RuntimeError("Mock AI provider failed.")
+    provider = MockAIReviewProvider(error=provider_error)
+    analyzer = PullRequestAnalyzer(
+        github_client=make_ai_integration_client(),
+        repository_context_builder=FakeSnapshotAwareRepositoryContextBuilder(
+            repository_context
+        ),
+        ai_review_engine=RecordingAIReviewEngine(provider),
+        ai_review_context_builder=AIReviewContextBuilder(),
+    )
+
+    with pytest.raises(RuntimeError, match="Mock AI provider failed"):
+        await analyzer.analyze("octocat", "CodeGuard", 42)
+
+    assert len(provider.reviewed_inputs) == 1

@@ -1,7 +1,16 @@
+from dataclasses import replace
+
 import pytest
 from fastapi.testclient import TestClient
 from pydantic import SecretStr
 
+from codeguard.ai.contracts import AIFindingCandidate, AIReviewResult
+from codeguard.ai.engine import AIReviewExecutionResult, AIReviewFindingAssessment
+from codeguard.ai.evidence_matching import (
+    EvidenceMatchReason,
+    EvidenceMatchResult,
+    EvidenceMatchStatus,
+)
 from codeguard.analyzers.python_ast import PythonAnalysisResult
 from codeguard.analyzers.python_risk import RiskFinding
 from codeguard.api.dependencies import get_pull_request_analyzer
@@ -75,6 +84,20 @@ def make_analysis(
         html_url="https://github.com/octocat/CodeGuard/pull/42",
         files=(file_result,),
         repository_context=repository_context,
+    )
+
+
+def make_ai_execution_result(
+    *,
+    summary: str,
+    assessments: tuple[AIReviewFindingAssessment, ...] = (),
+) -> AIReviewExecutionResult:
+    return AIReviewExecutionResult(
+        provider_result=AIReviewResult(
+            summary=summary,
+            findings=tuple(item.candidate for item in assessments),
+        ),
+        assessments=assessments,
     )
 
 
@@ -152,6 +175,101 @@ def test_review_endpoint_returns_structured_report() -> None:
         assert finding["cwe"] == "CWE-95"
 
         assert analyzer.calls == [("octocat", "CodeGuard", 42)]
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_review_endpoint_returns_ai_summary_and_assessments_separately() -> None:
+    candidate = AIFindingCandidate(
+        title="Potential unsafe dynamic execution",
+        severity="high",
+        confidence="medium",
+        file_path="src/auth.py",
+        line_number=2,
+        problem="The code executes dynamically supplied input.",
+        evidence="eval(value)",
+        why_it_matters="Untrusted input could execute arbitrary code.",
+        suggested_fix="Use a safe parser for the expected input format.",
+        recommended_validation="Add a test for untrusted input.",
+    )
+    assessment = AIReviewFindingAssessment(
+        candidate=candidate,
+        evidence_match=EvidenceMatchResult(
+            status=EvidenceMatchStatus.MATCHED,
+            reason=EvidenceMatchReason.EXACT_MATCH,
+            file_path="src/auth.py",
+            line_number=2,
+        ),
+    )
+    analysis = replace(
+        make_analysis(),
+        ai_review_result=make_ai_execution_result(
+            summary="One potential issue was assessed.",
+            assessments=(assessment,),
+        ),
+    )
+    analyzer = FakePullRequestAnalyzer(analysis=analysis)
+    client, app = create_test_client(analyzer)
+
+    try:
+        with client:
+            response = client.post(
+                "/api/v1/reviews",
+                json=API_PAYLOAD,
+                headers=API_HEADERS,
+            )
+
+        assert response.status_code == 200
+        data = response.json()
+
+        assert data["ai_review_summary"] == "One potential issue was assessed."
+        assert data["ai_assessments"] == [
+            {
+                "candidate": candidate.model_dump(mode="json"),
+                "evidence_match": {
+                    "status": "matched",
+                    "reason": "exact_match",
+                    "file_path": "src/auth.py",
+                    "line_number": 2,
+                    "location_reason": None,
+                },
+            }
+        ]
+        assert data["total_findings"] == 1
+        assert data["severity_counts"]["high"] == 1
+        assert len(data["findings"]) == 1
+        assert data["findings"][0]["rule_id"] == "PY001"
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_review_endpoint_serializes_empty_ai_assessments() -> None:
+    analysis = replace(
+        make_analysis(),
+        ai_review_result=make_ai_execution_result(
+            summary="No additional potential issues were identified.",
+        ),
+    )
+    analyzer = FakePullRequestAnalyzer(analysis=analysis)
+    client, app = create_test_client(analyzer)
+
+    try:
+        with client:
+            response = client.post(
+                "/api/v1/reviews",
+                json=API_PAYLOAD,
+                headers=API_HEADERS,
+            )
+
+        assert response.status_code == 200
+        data = response.json()
+
+        assert data["ai_review_summary"] == (
+            "No additional potential issues were identified."
+        )
+        assert data["ai_assessments"] == []
+        assert data["total_findings"] == 1
+        assert data["severity_counts"]["high"] == 1
     finally:
         app.dependency_overrides.clear()
 

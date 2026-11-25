@@ -5,7 +5,17 @@ from typing import Any
 from fastapi.testclient import TestClient
 from pydantic import SecretStr
 
-from codeguard.api.dependencies import get_github_client
+from codeguard.ai.contracts import AIFindingCandidate, AIReviewResult
+from codeguard.ai.engine import AIReviewExecutionResult, AIReviewFindingAssessment
+from codeguard.ai.evidence_matching import (
+    EvidenceMatchReason,
+    EvidenceMatchResult,
+    EvidenceMatchStatus,
+)
+from codeguard.api.dependencies import (
+    get_github_client,
+    get_pull_request_analyzer,
+)
 from codeguard.core.config import Settings
 from codeguard.github.exceptions import GitHubPermissionError
 from codeguard.github.schemas import (
@@ -15,6 +25,7 @@ from codeguard.github.schemas import (
     GitHubRepositoryTree,
 )
 from codeguard.main import create_app
+from codeguard.services.pull_request_analyzer import PullRequestAnalysisResult
 
 OWNER = "octocat"
 REPO = "CodeGuard"
@@ -234,6 +245,21 @@ def create_test_client(
     return TestClient(app), app
 
 
+class FakePullRequestAnalyzer:
+    """Analyzer returning a supplied result for publishing API tests."""
+
+    def __init__(self, analysis: PullRequestAnalysisResult) -> None:
+        self.analysis = analysis
+
+    async def analyze(
+        self,
+        owner: str,
+        repo: str,
+        pull_number: int,
+    ) -> PullRequestAnalysisResult:
+        return self.analysis
+
+
 def test_publish_endpoint_defaults_to_dry_run() -> None:
     github = FakeGitHubClient()
 
@@ -266,6 +292,73 @@ def test_publish_endpoint_defaults_to_dry_run() -> None:
         assert github.review_lookup_calls == 0
         assert github.created_reviews == []
 
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_publish_endpoint_keeps_ai_assessments_out_of_static_comments() -> None:
+    candidate = AIFindingCandidate(
+        title="Potential unsafe dynamic execution",
+        severity="high",
+        confidence="medium",
+        file_path="src/auth.py",
+        line_number=2,
+        problem="The code executes dynamically supplied input.",
+        evidence="eval(value)",
+        why_it_matters="Untrusted input could execute arbitrary code.",
+        suggested_fix="Use a safe parser for the expected input format.",
+        recommended_validation="Add a test for untrusted input.",
+    )
+    assessment = AIReviewFindingAssessment(
+        candidate=candidate,
+        evidence_match=EvidenceMatchResult(
+            status=EvidenceMatchStatus.MATCHED,
+            reason=EvidenceMatchReason.EXACT_MATCH,
+            file_path=candidate.file_path,
+            line_number=candidate.line_number,
+        ),
+    )
+    analysis = PullRequestAnalysisResult(
+        owner=OWNER,
+        repo=REPO,
+        pull_number=PULL_NUMBER,
+        title="Improve authentication",
+        state="open",
+        head_sha=HEAD_SHA,
+        base_sha=BASE_SHA,
+        html_url=f"https://github.com/{OWNER}/{REPO}/pull/{PULL_NUMBER}",
+        files=(),
+        ai_review_result=AIReviewExecutionResult(
+            provider_result=AIReviewResult(
+                summary="One potential issue was assessed.",
+                findings=(candidate,),
+            ),
+            assessments=(assessment,),
+        ),
+    )
+    github = FakeGitHubClient()
+    analyzer = FakePullRequestAnalyzer(analysis)
+    client, app = create_test_client(github, publishing_enabled=True)
+    app.dependency_overrides[get_pull_request_analyzer] = lambda: analyzer
+
+    try:
+        with client:
+            response = client.post(
+                "/api/v1/reviews/publish",
+                json={
+                    **API_PAYLOAD,
+                    "publish": True,
+                },
+                headers=API_HEADERS,
+            )
+
+        assert response.status_code == 200
+        data = response.json()
+
+        assert data["status"] == "skipped"
+        assert data["comment_count"] == 0
+        assert data["comments"] == []
+        assert github.created_reviews == []
     finally:
         app.dependency_overrides.clear()
 

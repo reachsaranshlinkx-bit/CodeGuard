@@ -89,6 +89,8 @@ def build_review_report(
         )
     )
 
+    ai_review_result = analysis.ai_review_result
+
     return ReviewReport(
         owner=analysis.owner,
         repo=analysis.repo,
@@ -99,4 +101,12 @@ def build_review_report(
         findings=tuple(review_findings),
         files_analyzed=files_analyzed,
         files_with_unavailable_mapping=tuple(sorted(unavailable_mapping)),
+        ai_review_summary=(
+            None
+            if ai_review_result is None
+            else ai_review_result.provider_result.summary
+        ),
+        ai_assessments=(
+            () if ai_review_result is None else ai_review_result.assessments
+        ),
     )

@@ -1,6 +1,14 @@
 import pytest
 from pydantic import ValidationError
 
+from codeguard.ai.contracts import AIFindingCandidate
+from codeguard.ai.engine import AIReviewFindingAssessment
+from codeguard.ai.evidence_matching import (
+    EvidenceMatchReason,
+    EvidenceMatchResult,
+    EvidenceMatchStatus,
+)
+from codeguard.ai.evidence_validation import EvidenceLocationReason
 from codeguard.schemas.review import (
     RepositoryContextResponse,
     ReviewFindingResponse,
@@ -48,6 +56,52 @@ def make_report_payload() -> dict:
             "medium": 0,
             "low": 0,
             "info": 0,
+        },
+    }
+
+
+def make_ai_assessment_payload(
+    *,
+    title: str,
+    status: EvidenceMatchStatus,
+    reason: EvidenceMatchReason,
+    location_reason: EvidenceLocationReason | None = None,
+) -> dict:
+    candidate = AIFindingCandidate(
+        title=title,
+        severity="high",
+        confidence="medium",
+        file_path="src/auth.py",
+        line_number=10,
+        problem="The code executes dynamically supplied input.",
+        evidence="eval(user_input)",
+        why_it_matters="Untrusted input could execute arbitrary code.",
+        suggested_fix="Use a safe parser for the expected input format.",
+        recommended_validation="Add a test for untrusted input.",
+    )
+    assessment = AIReviewFindingAssessment(
+        candidate=candidate,
+        evidence_match=EvidenceMatchResult(
+            status=status,
+            reason=reason,
+            file_path=candidate.file_path,
+            line_number=candidate.line_number,
+            location_reason=location_reason,
+        ),
+    )
+
+    return {
+        "candidate": assessment.candidate.model_dump(mode="json"),
+        "evidence_match": {
+            "status": assessment.evidence_match.status.value,
+            "reason": assessment.evidence_match.reason.value,
+            "file_path": assessment.evidence_match.file_path,
+            "line_number": assessment.evidence_match.line_number,
+            "location_reason": (
+                None
+                if assessment.evidence_match.location_reason is None
+                else assessment.evidence_match.location_reason.value
+            ),
         },
     }
 
@@ -240,3 +294,85 @@ def test_repository_context_response_rejects_inconsistent_completeness() -> None
                 ],
             }
         )
+
+
+def test_review_response_defaults_ai_assessment_fields() -> None:
+    report = ReviewResponse.model_validate(make_report_payload())
+
+    assert report.ai_review_summary is None
+    assert report.ai_assessments == ()
+
+
+def test_review_response_accepts_summary_without_assessments() -> None:
+    payload = make_report_payload()
+    payload["ai_review_summary"] = "No additional potential issues were identified."
+
+    report = ReviewResponse.model_validate(payload)
+
+    assert report.ai_review_summary == (
+        "No additional potential issues were identified."
+    )
+    assert report.ai_assessments == ()
+
+
+def test_review_response_preserves_all_fields_for_one_ai_assessment() -> None:
+    assessment = make_ai_assessment_payload(
+        title="Potential unsafe dynamic execution",
+        status=EvidenceMatchStatus.MATCHED,
+        reason=EvidenceMatchReason.EXACT_MATCH,
+    )
+    payload = make_report_payload()
+    payload["ai_review_summary"] = "One potential issue was assessed."
+    payload["ai_assessments"] = [assessment]
+
+    report = ReviewResponse.model_validate(payload)
+    serialized = report.model_dump(mode="json")
+
+    assert (
+        report.ai_assessments[0].candidate.model_dump(mode="json")
+        == (assessment["candidate"])
+    )
+    assert serialized["ai_assessments"] == [assessment]
+
+
+def test_review_response_preserves_multiple_evidence_assessment_outcomes() -> None:
+    assessments = [
+        make_ai_assessment_payload(
+            title="Matched candidate",
+            status=EvidenceMatchStatus.MATCHED,
+            reason=EvidenceMatchReason.EXACT_MATCH,
+        ),
+        make_ai_assessment_payload(
+            title="Mismatched candidate",
+            status=EvidenceMatchStatus.MISMATCHED,
+            reason=EvidenceMatchReason.CONTENT_MISMATCH,
+            location_reason=EvidenceLocationReason.LOCATION_VALID,
+        ),
+        make_ai_assessment_payload(
+            title="Unverifiable candidate",
+            status=EvidenceMatchStatus.UNVERIFIABLE,
+            reason=EvidenceMatchReason.LOCATION_UNVERIFIABLE,
+            location_reason=EvidenceLocationReason.INCOMPLETE_SNAPSHOT,
+        ),
+    ]
+    payload = make_report_payload()
+    payload["ai_review_summary"] = "Three potential issues were assessed."
+    payload["ai_assessments"] = assessments
+
+    report = ReviewResponse.model_validate(payload)
+
+    assert report.model_dump(mode="json")["ai_assessments"] == assessments
+    assert tuple(
+        item.evidence_match.status.value for item in report.ai_assessments
+    ) == (
+        "matched",
+        "mismatched",
+        "unverifiable",
+    )
+    assert tuple(
+        item.evidence_match.location_reason for item in report.ai_assessments
+    ) == (
+        None,
+        EvidenceLocationReason.LOCATION_VALID,
+        EvidenceLocationReason.INCOMPLETE_SNAPSHOT,
+    )
