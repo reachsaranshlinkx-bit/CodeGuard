@@ -88,8 +88,19 @@ def test_response_error_can_preserve_optional_http_status() -> None:
     )
 
     assert without_status.status_code is None
+    assert without_status.request_id is None
     assert with_status.status_code == 200
+    assert with_status.request_id is None
     assert str(with_status) == "Provider response was invalid."
+
+
+@pytest.mark.parametrize("request_id", ["", "   ", 123])
+def test_response_errors_reject_invalid_request_ids(request_id: object) -> None:
+    with pytest.raises(ValueError):
+        AIProviderResponseError(
+            "Invalid request ID.",
+            request_id=request_id,  # type: ignore[arg-type]
+        )
 
 
 @pytest.mark.parametrize("status_code", [99, 600, True, "500", None])
