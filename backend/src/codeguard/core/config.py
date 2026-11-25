@@ -31,6 +31,7 @@ class Settings(BaseSettings):
     environment: Environment = "development"
     debug: bool = False
     log_level: LogLevel = "INFO"
+    ai_provider: Literal["disabled", "mock"] = "disabled"
 
     github_token: SecretStr | None = None
     api_key: SecretStr | None = None
@@ -54,6 +55,15 @@ class Settings(BaseSettings):
         if self.webhook_worker_poll_interval_seconds < 1:
             raise ValueError(
                 "CODEGUARD_WEBHOOK_WORKER_POLL_INTERVAL_SECONDS must be at least 1."
+            )
+
+        if self.ai_provider == "mock" and self.environment not in (
+            "development",
+            "testing",
+        ):
+            raise ValueError(
+                "CODEGUARD_AI_PROVIDER=mock is only permitted in development "
+                "and testing."
             )
 
         if self.environment != "production":
