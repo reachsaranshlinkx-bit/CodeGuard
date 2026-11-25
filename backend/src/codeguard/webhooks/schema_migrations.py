@@ -3,7 +3,7 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
-CURRENT_SCHEMA_VERSION = 1
+CURRENT_SCHEMA_VERSION = 2
 
 
 def _apply_migration_v1(connection: sqlite3.Connection) -> None:
@@ -56,6 +56,17 @@ def _apply_migration_v1(connection: sqlite3.Connection) -> None:
     )
 
 
+def _apply_migration_v2(connection: sqlite3.Connection) -> None:
+    """Add the review contract compatibility default to existing operations."""
+
+    connection.execute(
+        """
+        ALTER TABLE ai_operations
+        ADD COLUMN review_contract_version TEXT NOT NULL DEFAULT 'review-v1'
+        """
+    )
+
+
 def migrate_webhook_database(database_path: Path) -> None:
     """Migrate the shared webhook database to the latest supported version."""
 
@@ -83,7 +94,12 @@ def migrate_webhook_database(database_path: Path) -> None:
 
         if current_version == 0:
             _apply_migration_v1(connection)
-            connection.execute(f"PRAGMA user_version = {CURRENT_SCHEMA_VERSION}")
+            connection.execute("PRAGMA user_version = 1")
+            current_version = 1
+
+        if current_version == 1:
+            _apply_migration_v2(connection)
+            connection.execute("PRAGMA user_version = 2")
 
         connection.commit()
     except Exception:

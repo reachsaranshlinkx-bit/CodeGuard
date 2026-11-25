@@ -15,12 +15,12 @@ def read_user_version(database_path: Path) -> int:
     return int(row[0])
 
 
-def test_fresh_database_migrates_to_version_one(tmp_path: Path) -> None:
+def test_fresh_database_migrates_to_version_two(tmp_path: Path) -> None:
     database_path = tmp_path / "webhook.sqlite3"
 
     migrate_webhook_database(database_path)
 
-    assert read_user_version(database_path) == 1
+    assert read_user_version(database_path) == 2
 
 
 def test_migration_creates_ai_operations_table(tmp_path: Path) -> None:
@@ -298,7 +298,7 @@ def test_migration_is_safe_when_called_twice(tmp_path: Path) -> None:
     migrate_webhook_database(database_path)
     migrate_webhook_database(database_path)
 
-    assert read_user_version(database_path) == 1
+    assert read_user_version(database_path) == 2
 
 
 def test_supported_migration_failure_rolls_back(
@@ -421,3 +421,273 @@ def test_application_runs_migration_before_store_construction(
     main_module.create_app(settings=settings)
 
     assert events == ["migration", "delivery_store", "job_queue"]
+
+
+def create_version_one_database(database_path: Path) -> None:
+    with sqlite3.connect(database_path) as connection:
+        connection.execute("PRAGMA user_version = 1")
+        connection.execute(
+            """
+            CREATE TABLE ai_operations (
+                operation_key TEXT PRIMARY KEY,
+                owner TEXT NOT NULL,
+                repo TEXT NOT NULL,
+                pull_number INTEGER NOT NULL CHECK(pull_number >= 1),
+                head_sha TEXT NOT NULL,
+                provider_identity TEXT NOT NULL,
+                model_identity TEXT NOT NULL,
+                prompt_contract_version TEXT NOT NULL,
+                context_contract_version TEXT NOT NULL,
+                evidence_contract_version TEXT NOT NULL,
+                status TEXT NOT NULL CHECK(status IN (
+                    'PENDING',
+                    'CLAIMED',
+                    'REQUEST_STARTED',
+                    'SUCCEEDED',
+                    'FAILED_PERMANENT',
+                    'OUTCOME_UNKNOWN'
+                )),
+                lease_owner TEXT,
+                lease_expires_at TEXT,
+                provider_request_started_at TEXT,
+                result_schema_version INTEGER,
+                serialization_version INTEGER,
+                result_json TEXT,
+                provider_request_id TEXT,
+                disposition TEXT,
+                safe_error TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE INDEX idx_ai_operations_status_lease
+            ON ai_operations(status, lease_expires_at)
+            """
+        )
+        connection.execute(
+            """
+            CREATE INDEX idx_ai_operations_repository
+            ON ai_operations(owner, repo, pull_number, head_sha)
+            """
+        )
+
+
+def test_version_one_database_upgrades_to_version_two(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "webhook.sqlite3"
+    create_version_one_database(database_path)
+
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            """
+            INSERT INTO ai_operations (
+                operation_key, owner, repo, pull_number, head_sha,
+                provider_identity, model_identity, prompt_contract_version,
+                context_contract_version, evidence_contract_version, status,
+                created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "existing-operation",
+                "octocat",
+                "CodeGuard",
+                42,
+                "a" * 40,
+                "provider",
+                "model",
+                "prompt-v1",
+                "context-v1",
+                "evidence-v1",
+                "SUCCEEDED",
+                "2026-01-01T00:00:00+00:00",
+                "2026-01-01T00:00:00+00:00",
+            ),
+        )
+
+    migrate_webhook_database(database_path)
+
+    assert read_user_version(database_path) == 2
+
+    with sqlite3.connect(database_path) as connection:
+        columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(ai_operations)")
+        }
+        row = connection.execute(
+            """
+            SELECT operation_key, status, updated_at, review_contract_version
+            FROM ai_operations
+            WHERE operation_key = 'existing-operation'
+            """
+        ).fetchone()
+
+    assert "review_contract_version" in columns
+    assert row is not None
+    assert row == (
+        "existing-operation",
+        "SUCCEEDED",
+        "2026-01-01T00:00:00+00:00",
+        "review-v1",
+    )
+
+
+def test_review_contract_version_column_exists_with_default(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "webhook.sqlite3"
+    migrate_webhook_database(database_path)
+
+    with sqlite3.connect(database_path) as connection:
+        columns = {
+            row[1]: row
+            for row in connection.execute("PRAGMA table_info(ai_operations)")
+        }
+
+    assert "review_contract_version" in columns
+    column = columns["review_contract_version"]
+    assert column[2] == "TEXT"
+    assert column[3] == 1
+    assert column[4] == "'review-v1'"
+
+
+def test_existing_operation_row_preserves_data_and_receives_default(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "webhook.sqlite3"
+    create_version_one_database(database_path)
+
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            """
+            INSERT INTO ai_operations (
+                operation_key, owner, repo, pull_number, head_sha,
+                provider_identity, model_identity, prompt_contract_version,
+                context_contract_version, evidence_contract_version, status,
+                lease_owner, lease_expires_at, provider_request_started_at,
+                result_schema_version, serialization_version, result_json,
+                provider_request_id, disposition, safe_error,
+                created_at, updated_at
+            )
+            VALUES (
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                ?, ?
+            )
+            """,
+            (
+                "preserved-operation",
+                "octocat",
+                "CodeGuard",
+                42,
+                "b" * 40,
+                "provider",
+                "model",
+                "prompt-v1",
+                "context-v1",
+                "evidence-v1",
+                "SUCCEEDED",
+                "worker-1",
+                "2026-01-02T00:00:00+00:00",
+                "2026-01-01T12:00:00+00:00",
+                1,
+                1,
+                '{"summary":"preserved"}',
+                "request-123",
+                "OUTCOME_UNKNOWN",
+                "safe diagnostic",
+                "2026-01-01T00:00:00+00:00",
+                "2026-01-01T12:00:00+00:00",
+            ),
+        )
+
+        original_row = connection.execute(
+            """
+            SELECT *
+            FROM ai_operations
+            WHERE operation_key = 'preserved-operation'
+            """
+        ).fetchone()
+
+    migrate_webhook_database(database_path)
+
+    with sqlite3.connect(database_path) as connection:
+        row = connection.execute(
+            """
+            SELECT *
+            FROM ai_operations
+            WHERE operation_key = 'preserved-operation'
+            """
+        ).fetchone()
+        columns = [
+            column[1]
+            for column in connection.execute("PRAGMA table_info(ai_operations)")
+        ]
+
+    assert original_row is not None
+    assert row is not None
+    assert row[:-1] == original_row
+    assert columns[-1] == "review_contract_version"
+    assert row[-1] == "review-v1"
+
+
+def test_existing_indexes_remain_intact_after_v2(tmp_path: Path) -> None:
+    database_path = tmp_path / "webhook.sqlite3"
+    create_version_one_database(database_path)
+
+    migrate_webhook_database(database_path)
+
+    with sqlite3.connect(database_path) as connection:
+        indexes = {
+            row[1]: [
+                index_row[2]
+                for index_row in connection.execute(f"PRAGMA index_info({row[1]})")
+            ]
+            for row in connection.execute("PRAGMA index_list('ai_operations')")
+        }
+
+    assert indexes["idx_ai_operations_status_lease"] == [
+        "status",
+        "lease_expires_at",
+    ]
+    assert indexes["idx_ai_operations_repository"] == [
+        "owner",
+        "repo",
+        "pull_number",
+        "head_sha",
+    ]
+
+
+def test_v2_migration_failure_rolls_back_column_and_version(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import codeguard.webhooks.schema_migrations as migrations
+
+    database_path = tmp_path / "webhook.sqlite3"
+    create_version_one_database(database_path)
+
+    real_apply_migration_v2 = migrations._apply_migration_v2
+
+    def fail_after_real_migration(connection: sqlite3.Connection) -> None:
+        real_apply_migration_v2(connection)
+        raise RuntimeError("simulated v2 migration failure")
+
+    monkeypatch.setattr(
+        migrations,
+        "_apply_migration_v2",
+        fail_after_real_migration,
+    )
+
+    with pytest.raises(RuntimeError, match="simulated v2 migration failure"):
+        migrate_webhook_database(database_path)
+
+    with sqlite3.connect(database_path) as connection:
+        columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(ai_operations)")
+        }
+
+    assert "review_contract_version" not in columns
+    assert read_user_version(database_path) == 1
