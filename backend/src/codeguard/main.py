@@ -23,6 +23,7 @@ from codeguard.services.webhook_review_processor import (
 )
 from codeguard.webhooks.delivery_store import WebhookDeliveryStore
 from codeguard.webhooks.job_queue import WebhookJobQueue
+from codeguard.webhooks.schema_migrations import migrate_webhook_database
 
 logger = logging.getLogger(__name__)
 
@@ -138,6 +139,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         debug=app_settings.debug,
         lifespan=lifespan,
     )
+
+    migrate_webhook_database(app_settings.webhook_database_path)
 
     app.state.webhook_delivery_store = WebhookDeliveryStore(
         database_path=app_settings.webhook_database_path,
