@@ -104,6 +104,8 @@ def test_analyzer_dependency_uses_provided_github_client() -> None:
 
     assert isinstance(analyzer, PullRequestAnalyzer)
     assert analyzer._github_client is client
+    assert analyzer._ai_review_engine is None
+    assert analyzer._ai_execution_coordinator is None
     assert isinstance(
         analyzer._repository_context_builder,
         RepositoryContextBuilder,

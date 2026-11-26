@@ -399,6 +399,12 @@ def test_application_runs_migration_before_store_construction(
         events.append("migration")
         assert received_path == database_path
 
+    def fake_operation_repository(*, database_path: Path) -> object:
+        events.append("operation_repository")
+        assert database_path == tmp_path / "webhook.sqlite3"
+        assert events[0] == "migration"
+        return object()
+
     def fake_delivery_store(*, database_path: Path) -> object:
         events.append("delivery_store")
         assert events[0] == "migration"
@@ -410,6 +416,11 @@ def test_application_runs_migration_before_store_construction(
         return object()
 
     monkeypatch.setattr(main_module, "migrate_webhook_database", fake_migration)
+    monkeypatch.setattr(
+        main_module,
+        "AIOperationRepository",
+        fake_operation_repository,
+    )
     monkeypatch.setattr(main_module, "WebhookDeliveryStore", fake_delivery_store)
     monkeypatch.setattr(main_module, "WebhookJobQueue", fake_job_queue)
 
@@ -420,7 +431,43 @@ def test_application_runs_migration_before_store_construction(
 
     main_module.create_app(settings=settings)
 
-    assert events == ["migration", "delivery_store", "job_queue"]
+    assert events == [
+        "migration",
+        "operation_repository",
+        "delivery_store",
+        "job_queue",
+    ]
+
+
+def test_application_propagates_database_migration_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository_construction_attempts = []
+
+    def failing_migration(database_path: Path) -> None:
+        raise RuntimeError("database migration failed")
+
+    def record_repository_construction(*, database_path: Path) -> object:
+        repository_construction_attempts.append(database_path)
+        return object()
+
+    monkeypatch.setattr(main_module, "migrate_webhook_database", failing_migration)
+    monkeypatch.setattr(
+        main_module,
+        "AIOperationRepository",
+        record_repository_construction,
+    )
+
+    with pytest.raises(RuntimeError, match="database migration failed"):
+        main_module.create_app(
+            settings=Settings(
+                _env_file=None,
+                webhook_database_path=tmp_path / "migration-failure.sqlite3",
+            )
+        )
+
+    assert repository_construction_attempts == []
 
 
 def create_version_one_database(database_path: Path) -> None:
