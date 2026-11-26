@@ -5,6 +5,9 @@ from codeguard.context.source_snapshot import (
     RepositorySourceSnapshot,
 )
 
+# Increment when source selection or rendered AI context semantics change.
+CONTEXT_CONTRACT_VERSION = "context-v1"
+
 
 class AIReviewContextBuilder:
     """Build bounded, deterministic source context for an AI review."""

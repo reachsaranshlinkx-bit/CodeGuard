@@ -9,6 +9,9 @@ from codeguard.ai.evidence_validation import (
 )
 from codeguard.context.source_snapshot import RepositorySourceSnapshot
 
+# Increment when evidence matching or location assessment semantics change.
+EVIDENCE_CONTRACT_VERSION = "evidence-v1"
+
 
 class EvidenceMatchStatus(StrEnum):
     """Overall outcome of independently matching AI-proposed evidence."""
