@@ -7,12 +7,13 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
-from threading import Barrier, Event
+from threading import Barrier, Event, current_thread
 from time import sleep
 
 import pytest
 
 import codeguard.ai.operation_repository as operation_repository_module
+from codeguard.ai.exceptions import AIRequestTransmissionState
 from codeguard.ai.operation_identity import AIOperationIdentity
 from codeguard.ai.operation_repository import (
     AIOperationClaimStatus,
@@ -54,6 +55,14 @@ def get_claimed_operation(
     assert claim.status is AIOperationClaimStatus.CLAIMED
     assert claim.lease_token is not None
     return created.operation_key, claim.lease_token
+
+
+def get_request_started_operation(
+    repository: AIOperationRepository,
+) -> tuple[str, str]:
+    operation_key, lease_token = get_claimed_operation(repository)
+    repository.mark_request_started(operation_key, lease_token)
+    return operation_key, lease_token
 
 
 def test_create_new_operation(repository: tuple[AIOperationRepository, Path]) -> None:
@@ -251,6 +260,356 @@ def test_request_started_operation_cannot_be_reclaimed(
     assert result.status is AIOperationClaimStatus.REQUEST_STARTED
     assert result.record.status is AIOperationStatus.REQUEST_STARTED
     assert result.lease_token is None
+
+
+def test_transition_rechecks_claimed_lease_after_write_lock_wait(
+    repository: tuple[AIOperationRepository, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo, database_path = repository
+    created = repo.create_or_get(make_identity())
+    claim = repo.claim(created.operation_key, 1)
+    assert claim.lease_token is not None
+
+    external_connection = sqlite3.connect(database_path, timeout=5.0)
+    transition_connection_opened = Event()
+    original_connection = repo._connection
+    executor = ThreadPoolExecutor(max_workers=1)
+
+    @contextmanager
+    def signal_transition_connection() -> Iterator[sqlite3.Connection]:
+        with original_connection() as connection:
+            transition_connection_opened.set()
+            yield connection
+
+    monkeypatch.setattr(repo, "_connection", signal_transition_connection)
+
+    try:
+        try:
+            external_connection.execute("BEGIN IMMEDIATE")
+            future = executor.submit(
+                repo.mark_request_started,
+                created.operation_key,
+                claim.lease_token,
+            )
+            assert transition_connection_opened.wait(timeout=5)
+            sleep(1.25)
+        finally:
+            try:
+                if external_connection.in_transaction:
+                    external_connection.rollback()
+            finally:
+                external_connection.close()
+
+        with pytest.raises(RuntimeError, match="transition rejected"):
+            future.result(timeout=5)
+    finally:
+        executor.shutdown(wait=True)
+
+    with sqlite3.connect(database_path) as connection:
+        row = connection.execute(
+            """
+            SELECT status, provider_request_started_at
+            FROM ai_operations WHERE operation_key = ?
+            """,
+            (created.operation_key,),
+        ).fetchone()
+    assert row == (AIOperationStatus.CLAIMED.value, None)
+
+
+def test_safe_retry_resets_request_started_operation_and_lease_fields(
+    repository: tuple[AIOperationRepository, Path],
+) -> None:
+    repo, database_path = repository
+    operation_key, lease_token = get_request_started_operation(repo)
+
+    record = repo.mark_safe_to_retry(
+        operation_key,
+        lease_token,
+        transmission_state=AIRequestTransmissionState.NOT_SENT,
+    )
+
+    assert record.status is AIOperationStatus.PENDING
+    assert record.lease_expires_at is None
+    assert record.provider_request_started_at is None
+    with sqlite3.connect(database_path) as connection:
+        row = connection.execute(
+            """
+            SELECT lease_owner, lease_expires_at, provider_request_started_at
+            FROM ai_operations WHERE operation_key = ?
+            """,
+            (operation_key,),
+        ).fetchone()
+    assert row == (None, None, None)
+
+
+def test_safe_retry_is_allowed_after_request_started_lease_expires(
+    repository: tuple[AIOperationRepository, Path],
+) -> None:
+    repo, database_path = repository
+    operation_key = repo.create_or_get(make_identity()).operation_key
+    lease_duration_seconds = 1.0
+    initial_claim = repo.claim(operation_key, lease_duration_seconds)
+    assert initial_claim.status is AIOperationClaimStatus.CLAIMED
+    assert initial_claim.lease_token is not None
+    original_lease_token = initial_claim.lease_token
+    started = repo.mark_request_started(operation_key, original_lease_token)
+    assert started.status is AIOperationStatus.REQUEST_STARTED
+
+    sleep(lease_duration_seconds + 0.1)
+
+    after_expiry_claim = repo.claim(operation_key, 60)
+    assert after_expiry_claim.status is AIOperationClaimStatus.REQUEST_STARTED
+    assert after_expiry_claim.record.status is AIOperationStatus.REQUEST_STARTED
+    assert after_expiry_claim.lease_token is None
+
+    reset = repo.mark_safe_to_retry(
+        operation_key,
+        original_lease_token,
+        transmission_state=AIRequestTransmissionState.NOT_SENT,
+    )
+
+    assert reset.status is AIOperationStatus.PENDING
+    assert reset.lease_expires_at is None
+    assert reset.provider_request_started_at is None
+    with sqlite3.connect(database_path) as connection:
+        row = connection.execute(
+            """
+            SELECT lease_owner, lease_expires_at, provider_request_started_at
+            FROM ai_operations WHERE operation_key = ?
+            """,
+            (operation_key,),
+        ).fetchone()
+    assert row == (None, None, None)
+
+
+def test_safe_retry_requires_a_valid_lease_owner_token(
+    repository: tuple[AIOperationRepository, Path],
+) -> None:
+    repo, _ = repository
+    operation_key, _ = get_request_started_operation(repo)
+
+    with pytest.raises(RuntimeError, match="transition rejected"):
+        repo.mark_safe_to_retry(
+            operation_key,
+            "wrong-token",
+            transmission_state=AIRequestTransmissionState.NOT_SENT,
+        )
+
+    with pytest.raises(ValueError, match="lease_token"):
+        repo.mark_safe_to_retry(
+            operation_key,
+            None,  # type: ignore[arg-type]
+            transmission_state=AIRequestTransmissionState.NOT_SENT,
+        )
+
+    with pytest.raises(TypeError):
+        repo.mark_safe_to_retry(  # type: ignore[call-arg]
+            operation_key,
+            transmission_state=AIRequestTransmissionState.NOT_SENT,
+        )
+
+
+def test_safe_retry_rejects_stale_lease_owner_token(
+    repository: tuple[AIOperationRepository, Path],
+) -> None:
+    repo, _ = repository
+    operation_key, stale_token = get_request_started_operation(repo)
+    repo.mark_safe_to_retry(
+        operation_key,
+        stale_token,
+        transmission_state=AIRequestTransmissionState.NOT_SENT,
+    )
+    new_claim = repo.claim(operation_key, 60)
+    assert new_claim.lease_token is not None
+    repo.mark_request_started(operation_key, new_claim.lease_token)
+
+    with pytest.raises(RuntimeError, match="transition rejected"):
+        repo.mark_safe_to_retry(
+            operation_key,
+            stale_token,
+            transmission_state=AIRequestTransmissionState.NOT_SENT,
+        )
+
+
+def test_safe_retry_rejects_unconfirmed_transmission_state(
+    repository: tuple[AIOperationRepository, Path],
+) -> None:
+    repo, _ = repository
+    operation_key, lease_token = get_request_started_operation(repo)
+
+    with pytest.raises(ValueError, match="NOT_SENT"):
+        repo.mark_safe_to_retry(
+            operation_key,
+            lease_token,
+            transmission_state=AIRequestTransmissionState.UNKNOWN,
+        )
+
+    assert repo.get(operation_key).status is AIOperationStatus.REQUEST_STARTED  # type: ignore[union-attr]
+
+
+@pytest.mark.parametrize(
+    "source_status",
+    [AIOperationStatus.PENDING, AIOperationStatus.CLAIMED],
+)
+def test_safe_retry_rejects_non_started_source_states(
+    repository: tuple[AIOperationRepository, Path],
+    source_status: AIOperationStatus,
+) -> None:
+    repo, _ = repository
+    record = repo.create_or_get(make_identity())
+    lease_token = "not-current"
+    if source_status is AIOperationStatus.CLAIMED:
+        claim = repo.claim(record.operation_key, 60)
+        assert claim.lease_token is not None
+        lease_token = claim.lease_token
+
+    with pytest.raises(RuntimeError, match="transition rejected"):
+        repo.mark_safe_to_retry(
+            record.operation_key,
+            lease_token,
+            transmission_state=AIRequestTransmissionState.NOT_SENT,
+        )
+
+
+@pytest.mark.parametrize(
+    "terminal_status",
+    [
+        AIOperationStatus.SUCCEEDED,
+        AIOperationStatus.FAILED_PERMANENT,
+        AIOperationStatus.OUTCOME_UNKNOWN,
+    ],
+)
+def test_safe_retry_cannot_reset_terminal_operations(
+    repository: tuple[AIOperationRepository, Path],
+    terminal_status: AIOperationStatus,
+) -> None:
+    repo, _ = repository
+    operation_key, lease_token = get_claimed_operation(repo)
+
+    if terminal_status is AIOperationStatus.SUCCEEDED:
+        repo.mark_request_started(operation_key, lease_token)
+        repo.mark_succeeded(
+            operation_key,
+            lease_token,
+            result_json='{"complete":true}',
+            result_schema_version=1,
+            serialization_version=1,
+        )
+    elif terminal_status is AIOperationStatus.FAILED_PERMANENT:
+        repo.mark_failed_permanent(
+            operation_key,
+            lease_token,
+            disposition="permanent",
+            safe_error="safe",
+        )
+    else:
+        repo.mark_outcome_unknown(
+            operation_key,
+            lease_token,
+            disposition="unknown",
+            safe_error="safe",
+        )
+
+    with pytest.raises(RuntimeError, match="transition rejected"):
+        repo.mark_safe_to_retry(
+            operation_key,
+            lease_token,
+            transmission_state=AIRequestTransmissionState.NOT_SENT,
+        )
+
+    assert repo.get(operation_key).status is terminal_status  # type: ignore[union-attr]
+
+
+def test_safe_retry_operation_can_be_claimed_again(
+    repository: tuple[AIOperationRepository, Path],
+) -> None:
+    repo, _ = repository
+    operation_key, old_token = get_request_started_operation(repo)
+    repo.mark_safe_to_retry(
+        operation_key,
+        old_token,
+        transmission_state=AIRequestTransmissionState.NOT_SENT,
+    )
+
+    claim = repo.claim(operation_key, 60)
+
+    assert claim.status is AIOperationClaimStatus.CLAIMED
+    assert claim.lease_token is not None
+    assert claim.lease_token != old_token
+
+
+def test_claim_waits_for_safe_retry_transition_commit(
+    repository: tuple[AIOperationRepository, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo, _ = repository
+    operation_key, lease_token = get_request_started_operation(repo)
+    transition_commit_started = Event()
+    allow_transition_commit = Event()
+    claim_begin_started = Event()
+    original_connect = sqlite3.connect
+
+    class CoordinatedConnection(sqlite3.Connection):
+        def execute(
+            self,
+            sql: str,
+            parameters: tuple[object, ...] = (),
+        ) -> sqlite3.Cursor:
+            if (
+                sql == "BEGIN IMMEDIATE"
+                and current_thread().name == "safe-retry-claim_1"
+            ):
+                claim_begin_started.set()
+            return super().execute(sql, parameters)
+
+        def commit(self) -> None:
+            if current_thread().name == "safe-retry-claim_0":
+                transition_commit_started.set()
+                if not allow_transition_commit.wait(timeout=5):
+                    raise TimeoutError("Timed out waiting to commit safe retry.")
+            super().commit()
+
+    def coordinated_connect(
+        *args: object,
+        **kwargs: object,
+    ) -> CoordinatedConnection:
+        kwargs["factory"] = CoordinatedConnection
+        connection = original_connect(*args, **kwargs)  # type: ignore[arg-type]
+        return connection
+
+    monkeypatch.setattr(
+        operation_repository_module.sqlite3,
+        "connect",
+        coordinated_connect,
+    )
+
+    executor = ThreadPoolExecutor(
+        max_workers=2,
+        thread_name_prefix="safe-retry-claim",
+    )
+    try:
+        transition_future = executor.submit(
+            repo.mark_safe_to_retry,
+            operation_key,
+            lease_token,
+            transmission_state=AIRequestTransmissionState.NOT_SENT,
+        )
+        assert transition_commit_started.wait(timeout=5)
+
+        claim_future = executor.submit(repo.claim, operation_key, 60)
+        assert claim_begin_started.wait(timeout=5)
+        assert not claim_future.done()
+
+        allow_transition_commit.set()
+        transitioned = transition_future.result(timeout=5)
+        claim = claim_future.result(timeout=5)
+    finally:
+        allow_transition_commit.set()
+        executor.shutdown(wait=True)
+
+    assert transitioned.status is AIOperationStatus.PENDING
+    assert claim.status is AIOperationClaimStatus.CLAIMED
 
 
 def test_successful_result_persistence_is_atomic(

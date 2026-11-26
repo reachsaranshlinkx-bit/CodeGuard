@@ -13,6 +13,7 @@ from numbers import Real
 from pathlib import Path
 from typing import cast
 
+from codeguard.ai.exceptions import AIRequestTransmissionState
 from codeguard.ai.operation_identity import (
     AI_OPERATION_FORMAT_VERSION,
     AIOperationIdentity,
@@ -416,14 +417,14 @@ class AIOperationRepository:
     ) -> AIOperationRecord:
         """Record provider request start for the current lease owner."""
 
-        now_text = _timestamp(_utc_now())
         return self._transition(
             operation_key,
             lease_token,
             expected_statuses=(AIOperationStatus.CLAIMED,),
             new_status=AIOperationStatus.REQUEST_STARTED,
-            assignments="provider_request_started_at = ?",
-            values=(now_text,),
+            assignments="",
+            values=(),
+            timestamp_assignment="provider_request_started_at = ?",
         )
 
     def mark_succeeded(
@@ -459,6 +460,32 @@ class AIOperationRepository:
                 serialization_version,
                 provider_request_id,
             ),
+        )
+
+    def mark_safe_to_retry(
+        self,
+        operation_key: str,
+        lease_token: str,
+        *,
+        transmission_state: AIRequestTransmissionState,
+    ) -> AIOperationRecord:
+        """Return to PENDING only when the provider request was not sent."""
+
+        if transmission_state is not AIRequestTransmissionState.NOT_SENT:
+            raise ValueError(
+                "Safe retry requires an independently confirmed NOT_SENT state."
+            )
+
+        return self._transition(
+            operation_key,
+            lease_token,
+            expected_statuses=(AIOperationStatus.REQUEST_STARTED,),
+            new_status=AIOperationStatus.PENDING,
+            assignments=(
+                "lease_owner = NULL, lease_expires_at = NULL, "
+                "provider_request_started_at = NULL"
+            ),
+            values=(),
         )
 
     def mark_failed_permanent(
@@ -539,32 +566,41 @@ class AIOperationRepository:
         new_status: AIOperationStatus,
         assignments: str,
         values: tuple[object, ...],
+        timestamp_assignment: str | None = None,
     ) -> AIOperationRecord:
         _validate_operation_key(operation_key)
         if not isinstance(lease_token, str) or not lease_token:
             raise ValueError("lease_token must be a non-empty string.")
 
-        now_text = _timestamp(_utc_now())
+        set_assignments = assignments
+        if timestamp_assignment is not None:
+            set_assignments = (
+                f"{timestamp_assignment}, {assignments}"
+                if assignments
+                else timestamp_assignment
+            )
         expected_sql = ", ".join("?" for _ in expected_statuses)
         statement = (
-            f"UPDATE ai_operations SET {assignments}, status = ?, updated_at = ? "
+            f"UPDATE ai_operations SET {set_assignments}, status = ?, updated_at = ? "
             f"WHERE operation_key = ? AND lease_owner = ? "
             f"AND status IN ({expected_sql}) "
             "AND (status != ? OR lease_expires_at > ?)"
         )
-        parameters = (
-            *values,
-            new_status.value,
-            now_text,
-            operation_key,
-            lease_token,
-            *(status.value for status in expected_statuses),
-            AIOperationStatus.CLAIMED.value,
-            now_text,
-        )
 
         with self._connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            now_text = _timestamp(_utc_now())
+            parameters = (
+                *((now_text,) if timestamp_assignment is not None else ()),
+                *values,
+                new_status.value,
+                now_text,
+                operation_key,
+                lease_token,
+                *(status.value for status in expected_statuses),
+                AIOperationStatus.CLAIMED.value,
+                now_text,
+            )
             cursor = connection.execute(statement, parameters)
             if cursor.rowcount != 1:
                 raise RuntimeError(
