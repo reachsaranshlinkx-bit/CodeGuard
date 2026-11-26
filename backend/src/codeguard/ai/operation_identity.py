@@ -2,9 +2,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from dataclasses import dataclass
 
-AI_OPERATION_FORMAT_VERSION = "ai-operation-v1"
+AI_OPERATION_V1_FORMAT_VERSION = "ai-operation-v1"
+AI_OPERATION_V2_FORMAT_VERSION = "ai-operation-v2"
+AI_OPERATION_FORMAT_VERSION = AI_OPERATION_V2_FORMAT_VERSION
+
+_INPUT_FINGERPRINT_PATTERN = re.compile(r"ai-execution-input-v1:[0-9a-f]{64}\Z")
 
 
 def _normalize_repository_identifier(value: str, field_name: str) -> str:
@@ -29,9 +34,51 @@ def _normalize_required_string(value: str, field_name: str) -> str:
     return normalized
 
 
+def _normalize_identity_fields(identity: LegacyAIOperationIdentity) -> None:
+    object.__setattr__(
+        identity,
+        "owner",
+        _normalize_repository_identifier(identity.owner, "owner"),
+    )
+    object.__setattr__(
+        identity,
+        "repo",
+        _normalize_repository_identifier(identity.repo, "repo"),
+    )
+
+    if (
+        isinstance(identity.pull_number, bool)
+        or not isinstance(identity.pull_number, int)
+        or identity.pull_number <= 0
+    ):
+        raise ValueError("pull_number must be a positive integer.")
+
+    object.__setattr__(
+        identity,
+        "head_sha",
+        _normalize_required_string(identity.head_sha, "head_sha").lower(),
+    )
+    for field_name in (
+        "provider_identity",
+        "model_identity",
+        "prompt_contract_version",
+        "context_contract_version",
+        "evidence_contract_version",
+        "review_contract_version",
+    ):
+        object.__setattr__(
+            identity,
+            field_name,
+            _normalize_required_string(
+                getattr(identity, field_name),
+                field_name,
+            ),
+        )
+
+
 @dataclass(frozen=True, slots=True)
-class AIOperationIdentity:
-    """Stable identity inputs for one logical AI review operation."""
+class LegacyAIOperationIdentity:
+    """The existing v1 identity fields, without an execution input fingerprint."""
 
     owner: str
     repo: str
@@ -45,84 +92,46 @@ class AIOperationIdentity:
     review_contract_version: str
 
     def __post_init__(self) -> None:
-        object.__setattr__(
-            self,
-            "owner",
-            _normalize_repository_identifier(self.owner, "owner"),
-        )
-        object.__setattr__(
-            self,
-            "repo",
-            _normalize_repository_identifier(self.repo, "repo"),
-        )
+        _normalize_identity_fields(self)
+
+
+@dataclass(frozen=True, slots=True)
+class AIOperationIdentity(LegacyAIOperationIdentity):
+    """Stable v2 identity inputs for one logical AI review operation."""
+
+    input_fingerprint: str
+
+    def __post_init__(self) -> None:
+        _normalize_identity_fields(self)
 
         if (
-            isinstance(self.pull_number, bool)
-            or not isinstance(self.pull_number, int)
-            or self.pull_number <= 0
+            not isinstance(self.input_fingerprint, str)
+            or _INPUT_FINGERPRINT_PATTERN.fullmatch(self.input_fingerprint) is None
         ):
-            raise ValueError("pull_number must be a positive integer.")
-
-        object.__setattr__(
-            self,
-            "head_sha",
-            _normalize_required_string(self.head_sha, "head_sha").lower(),
-        )
-        object.__setattr__(
-            self,
-            "provider_identity",
-            _normalize_required_string(
-                self.provider_identity,
-                "provider_identity",
-            ),
-        )
-        object.__setattr__(
-            self,
-            "model_identity",
-            _normalize_required_string(
-                self.model_identity,
-                "model_identity",
-            ),
-        )
-        object.__setattr__(
-            self,
-            "prompt_contract_version",
-            _normalize_required_string(
-                self.prompt_contract_version,
-                "prompt_contract_version",
-            ),
-        )
-        object.__setattr__(
-            self,
-            "context_contract_version",
-            _normalize_required_string(
-                self.context_contract_version,
-                "context_contract_version",
-            ),
-        )
-        object.__setattr__(
-            self,
-            "evidence_contract_version",
-            _normalize_required_string(
-                self.evidence_contract_version,
-                "evidence_contract_version",
-            ),
-        )
-        object.__setattr__(
-            self,
-            "review_contract_version",
-            _normalize_required_string(
-                self.review_contract_version,
-                "review_contract_version",
-            ),
-        )
+            raise ValueError(
+                "input_fingerprint must be a versioned lowercase SHA-256 fingerprint."
+            )
 
 
-def build_ai_operation_key(identity: AIOperationIdentity) -> str:
-    """Build a canonical, explicitly versioned AI operation key."""
+def _build_key(canonical: dict[str, object], format_version: str) -> str:
+    encoded = json.dumps(
+        canonical,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    digest = hashlib.sha256(encoded).hexdigest()
+    return f"{format_version}:{digest}"
+
+
+def build_legacy_ai_operation_key(identity: LegacyAIOperationIdentity) -> str:
+    """Rebuild the exact historical v1 key for validating stored legacy rows."""
+
+    if type(identity) is not LegacyAIOperationIdentity:
+        raise TypeError("Legacy key construction requires a v1 identity.")
 
     canonical = {
-        "format_version": AI_OPERATION_FORMAT_VERSION,
+        "format_version": AI_OPERATION_V1_FORMAT_VERSION,
         "owner": identity.owner,
         "repo": identity.repo,
         "pull_number": identity.pull_number,
@@ -134,11 +143,27 @@ def build_ai_operation_key(identity: AIOperationIdentity) -> str:
         "evidence_contract_version": identity.evidence_contract_version,
         "review_contract_version": identity.review_contract_version,
     }
-    encoded = json.dumps(
-        canonical,
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=False,
-    ).encode("utf-8")
-    digest = hashlib.sha256(encoded).hexdigest()
-    return f"{AI_OPERATION_FORMAT_VERSION}:{digest}"
+    return _build_key(canonical, AI_OPERATION_V1_FORMAT_VERSION)
+
+
+def build_ai_operation_key(identity: AIOperationIdentity) -> str:
+    """Build the canonical v2 key for a fingerprinted AI operation."""
+
+    if not isinstance(identity, AIOperationIdentity):
+        raise TypeError("New operation keys require a v2 identity.")
+
+    canonical = {
+        "format_version": AI_OPERATION_V2_FORMAT_VERSION,
+        "owner": identity.owner,
+        "repo": identity.repo,
+        "pull_number": identity.pull_number,
+        "head_sha": identity.head_sha,
+        "provider_identity": identity.provider_identity,
+        "model_identity": identity.model_identity,
+        "prompt_contract_version": identity.prompt_contract_version,
+        "context_contract_version": identity.context_contract_version,
+        "evidence_contract_version": identity.evidence_contract_version,
+        "review_contract_version": identity.review_contract_version,
+        "input_fingerprint": identity.input_fingerprint,
+    }
+    return _build_key(canonical, AI_OPERATION_V2_FORMAT_VERSION)

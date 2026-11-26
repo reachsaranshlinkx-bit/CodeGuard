@@ -14,13 +14,20 @@ import pytest
 
 import codeguard.ai.operation_repository as operation_repository_module
 from codeguard.ai.exceptions import AIRequestTransmissionState
-from codeguard.ai.operation_identity import AIOperationIdentity
+from codeguard.ai.operation_identity import (
+    AIOperationIdentity,
+    LegacyAIOperationIdentity,
+    build_legacy_ai_operation_key,
+)
 from codeguard.ai.operation_repository import (
     AIOperationClaimStatus,
     AIOperationRepository,
+    AIOperationRepositoryError,
     AIOperationStatus,
 )
 from codeguard.webhooks.schema_migrations import migrate_webhook_database
+
+TEST_FINGERPRINT = "ai-execution-input-v1:" + "f" * 64
 
 
 def make_identity(**updates: object) -> AIOperationIdentity:
@@ -35,9 +42,27 @@ def make_identity(**updates: object) -> AIOperationIdentity:
         "context_contract_version": "context-v1",
         "evidence_contract_version": "evidence-v1",
         "review_contract_version": "review-v1",
+        "input_fingerprint": TEST_FINGERPRINT,
     }
     values.update(updates)
     return AIOperationIdentity(**values)  # type: ignore[arg-type]
+
+
+def make_legacy_identity(**updates: object) -> LegacyAIOperationIdentity:
+    values: dict[str, object] = {
+        "owner": "octocat",
+        "repo": "CodeGuard",
+        "pull_number": 42,
+        "head_sha": "ABCDEF123456",
+        "provider_identity": "provider-openai-compatible",
+        "model_identity": "model-review-v1",
+        "prompt_contract_version": "prompt-v1",
+        "context_contract_version": "context-v1",
+        "evidence_contract_version": "evidence-v1",
+        "review_contract_version": "review-v1",
+    }
+    values.update(updates)
+    return LegacyAIOperationIdentity(**values)  # type: ignore[arg-type]
 
 
 @pytest.fixture
@@ -45,6 +70,50 @@ def repository(tmp_path: Path) -> tuple[AIOperationRepository, Path]:
     database_path = tmp_path / "webhook.sqlite3"
     migrate_webhook_database(database_path)
     return AIOperationRepository(database_path), database_path
+
+
+def insert_legacy_operation(
+    database_path: Path,
+    *,
+    identity: LegacyAIOperationIdentity | None = None,
+    status: str = "SUCCEEDED",
+    result_json: str | None = '{"legacy":"opaque"}',
+    input_fingerprint: str | None = None,
+) -> str:
+    legacy_identity = identity or make_legacy_identity()
+    operation_key = build_legacy_ai_operation_key(legacy_identity)
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            """
+            INSERT INTO ai_operations (
+                operation_key, owner, repo, pull_number, head_sha,
+                provider_identity, model_identity, prompt_contract_version,
+                context_contract_version, evidence_contract_version,
+                review_contract_version, input_fingerprint, status, result_json,
+                created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                operation_key,
+                legacy_identity.owner,
+                legacy_identity.repo,
+                legacy_identity.pull_number,
+                legacy_identity.head_sha,
+                legacy_identity.provider_identity,
+                legacy_identity.model_identity,
+                legacy_identity.prompt_contract_version,
+                legacy_identity.context_contract_version,
+                legacy_identity.evidence_contract_version,
+                legacy_identity.review_contract_version,
+                input_fingerprint,
+                status,
+                result_json,
+                "2026-01-01T00:00:00+00:00",
+                "2026-01-02T00:00:00+00:00",
+            ),
+        )
+    return operation_key
 
 
 def get_claimed_operation(
@@ -72,6 +141,7 @@ def test_create_new_operation(repository: tuple[AIOperationRepository, Path]) ->
 
     assert record.status is AIOperationStatus.PENDING
     assert record.identity == make_identity()
+    assert record.identity.input_fingerprint == TEST_FINGERPRINT
     assert record.result_json is None
 
 
@@ -111,7 +181,7 @@ def test_complete_identity_including_review_contract_is_persisted(
             SELECT owner, repo, pull_number, head_sha, provider_identity,
                    model_identity, prompt_contract_version,
                    context_contract_version, evidence_contract_version,
-                   review_contract_version
+                   review_contract_version, input_fingerprint
             FROM ai_operations WHERE operation_key = ?
             """,
             (record.operation_key,),
@@ -127,6 +197,7 @@ def test_complete_identity_including_review_contract_is_persisted(
         identity.context_contract_version,
         identity.evidence_contract_version,
         identity.review_contract_version,
+        identity.input_fingerprint,
     )
 
 
@@ -149,15 +220,165 @@ def test_mismatched_stored_identity_is_rejected(
         repo.create_or_get(make_identity())
 
 
+def test_create_or_get_rejects_legacy_identity(
+    repository: tuple[AIOperationRepository, Path],
+) -> None:
+    repo, _ = repository
+
+    with pytest.raises(TypeError, match="v2"):
+        repo.create_or_get(make_legacy_identity())  # type: ignore[arg-type]
+
+
+def test_valid_legacy_successful_row_remains_readable_and_opaque(
+    repository: tuple[AIOperationRepository, Path],
+) -> None:
+    repo, database_path = repository
+    legacy_identity = make_legacy_identity()
+    opaque_result = '{"legacy":"opaque"}'
+    operation_key = insert_legacy_operation(
+        database_path,
+        identity=legacy_identity,
+        result_json=opaque_result,
+    )
+
+    record = repo.get(operation_key)
+
+    assert record is not None
+    assert type(record.identity) is LegacyAIOperationIdentity
+    assert record.identity == legacy_identity
+    assert record.operation_key == operation_key
+    assert record.status is AIOperationStatus.SUCCEEDED
+    assert record.result_json == opaque_result
+    assert record.created_at == "2026-01-01T00:00:00+00:00"
+    assert record.updated_at == "2026-01-02T00:00:00+00:00"
+
+
+def test_matching_v2_operation_is_separate_and_does_not_reuse_legacy_result(
+    repository: tuple[AIOperationRepository, Path],
+) -> None:
+    repo, database_path = repository
+    legacy_key = insert_legacy_operation(database_path)
+
+    v2_identity = make_identity()
+    new_record = repo.create_or_get(v2_identity)
+
+    assert new_record.operation_key != legacy_key
+    assert new_record.identity == v2_identity
+    assert new_record.status is AIOperationStatus.PENDING
+    assert new_record.result_json is None
+    assert repo.get(legacy_key).result_json == '{"legacy":"opaque"}'  # type: ignore[union-attr]
+
+    with sqlite3.connect(database_path) as connection:
+        rows = connection.execute(
+            """
+            SELECT operation_key, input_fingerprint, result_json
+            FROM ai_operations ORDER BY operation_key
+            """
+        ).fetchall()
+
+    assert len(rows) == 2
+    v2_row = next(row for row in rows if row[0] == new_record.operation_key)
+    assert v2_row == (
+        new_record.operation_key,
+        v2_identity.input_fingerprint,
+        None,
+    )
+
+
+def test_legacy_pending_operation_cannot_be_claimed_or_transitioned(
+    repository: tuple[AIOperationRepository, Path],
+) -> None:
+    repo, database_path = repository
+    operation_key = insert_legacy_operation(
+        database_path,
+        status=AIOperationStatus.PENDING.value,
+        result_json=None,
+    )
+
+    with pytest.raises(AIOperationRepositoryError, match="Legacy"):
+        repo.claim(operation_key, 60)
+
+    with pytest.raises(AIOperationRepositoryError, match="Legacy"):
+        repo.mark_request_started(operation_key, "historical-lease")
+
+
+def test_legacy_key_with_fingerprint_is_rejected(
+    repository: tuple[AIOperationRepository, Path],
+) -> None:
+    repo, database_path = repository
+    operation_key = insert_legacy_operation(
+        database_path,
+        input_fingerprint=TEST_FINGERPRINT,
+    )
+
+    with pytest.raises(AIOperationRepositoryError, match="unexpected fingerprint"):
+        repo.get(operation_key)
+
+
+def test_v2_key_without_fingerprint_is_rejected(
+    repository: tuple[AIOperationRepository, Path],
+) -> None:
+    repo, database_path = repository
+    record = repo.create_or_get(make_identity())
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            "UPDATE ai_operations SET input_fingerprint = NULL WHERE operation_key = ?",
+            (record.operation_key,),
+        )
+
+    with pytest.raises(
+        AIOperationRepositoryError, match="missing its input fingerprint"
+    ):
+        repo.get(record.operation_key)
+
+
+@pytest.mark.parametrize(
+    "fingerprint",
+    ["", "invalid", "ai-execution-input-v1:" + "F" * 64],
+)
+def test_v2_key_with_malformed_fingerprint_is_rejected(
+    repository: tuple[AIOperationRepository, Path],
+    fingerprint: str,
+) -> None:
+    repo, database_path = repository
+    record = repo.create_or_get(make_identity())
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            "UPDATE ai_operations SET input_fingerprint = ? WHERE operation_key = ?",
+            (fingerprint, record.operation_key),
+        )
+
+    with pytest.raises(AIOperationRepositoryError, match="identity is invalid"):
+        repo.get(record.operation_key)
+
+
+def test_identity_values_that_do_not_reproduce_key_are_rejected(
+    repository: tuple[AIOperationRepository, Path],
+) -> None:
+    repo, database_path = repository
+    record = repo.create_or_get(make_identity())
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            "UPDATE ai_operations SET provider_identity = ? WHERE operation_key = ?",
+            ("different-provider", record.operation_key),
+        )
+
+    with pytest.raises(AIOperationRepositoryError, match="does not match"):
+        repo.get(record.operation_key)
+
+
 def test_get_returns_none_for_missing_operation(
     repository: tuple[AIOperationRepository, Path],
 ) -> None:
     repo, _ = repository
 
-    assert repo.get("ai-operation-v1:" + "0" * 64) is None
+    assert repo.get("ai-operation-v2:" + "0" * 64) is None
 
 
-@pytest.mark.parametrize("operation_key", ["", "not-a-key", "ai-operation-v1:xyz"])
+@pytest.mark.parametrize(
+    "operation_key",
+    ["", "not-a-key", "ai-operation-v1:xyz", "ai-operation-v2:xyz"],
+)
 def test_invalid_operation_keys_are_rejected(
     repository: tuple[AIOperationRepository, Path],
     operation_key: str,

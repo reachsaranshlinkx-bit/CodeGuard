@@ -3,7 +3,7 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
-CURRENT_SCHEMA_VERSION = 2
+CURRENT_SCHEMA_VERSION = 3
 
 
 def _apply_migration_v1(connection: sqlite3.Connection) -> None:
@@ -67,6 +67,17 @@ def _apply_migration_v2(connection: sqlite3.Connection) -> None:
     )
 
 
+def _apply_migration_v3(connection: sqlite3.Connection) -> None:
+    """Add the optional execution fingerprint without assigning legacy values."""
+
+    connection.execute(
+        """
+        ALTER TABLE ai_operations
+        ADD COLUMN input_fingerprint TEXT
+        """
+    )
+
+
 def migrate_webhook_database(database_path: Path) -> None:
     """Migrate the shared webhook database to the latest supported version."""
 
@@ -100,6 +111,11 @@ def migrate_webhook_database(database_path: Path) -> None:
         if current_version == 1:
             _apply_migration_v2(connection)
             connection.execute("PRAGMA user_version = 2")
+            current_version = 2
+
+        if current_version == 2:
+            _apply_migration_v3(connection)
+            connection.execute("PRAGMA user_version = 3")
 
         connection.commit()
     except Exception:

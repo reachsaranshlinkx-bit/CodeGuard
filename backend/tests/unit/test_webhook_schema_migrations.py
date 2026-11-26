@@ -15,12 +15,12 @@ def read_user_version(database_path: Path) -> int:
     return int(row[0])
 
 
-def test_fresh_database_migrates_to_version_two(tmp_path: Path) -> None:
+def test_fresh_database_migrates_to_version_three(tmp_path: Path) -> None:
     database_path = tmp_path / "webhook.sqlite3"
 
     migrate_webhook_database(database_path)
 
-    assert read_user_version(database_path) == 2
+    assert read_user_version(database_path) == 3
 
 
 def test_migration_creates_ai_operations_table(tmp_path: Path) -> None:
@@ -298,7 +298,7 @@ def test_migration_is_safe_when_called_twice(tmp_path: Path) -> None:
     migrate_webhook_database(database_path)
     migrate_webhook_database(database_path)
 
-    assert read_user_version(database_path) == 2
+    assert read_user_version(database_path) == 3
 
 
 def test_supported_migration_failure_rolls_back(
@@ -475,7 +475,19 @@ def create_version_one_database(database_path: Path) -> None:
         )
 
 
-def test_version_one_database_upgrades_to_version_two(
+def create_version_two_database(database_path: Path) -> None:
+    create_version_one_database(database_path)
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            """
+            ALTER TABLE ai_operations
+            ADD COLUMN review_contract_version TEXT NOT NULL DEFAULT 'review-v1'
+            """
+        )
+        connection.execute("PRAGMA user_version = 2")
+
+
+def test_version_one_database_upgrades_to_version_three(
     tmp_path: Path,
 ) -> None:
     database_path = tmp_path / "webhook.sqlite3"
@@ -511,7 +523,7 @@ def test_version_one_database_upgrades_to_version_two(
 
     migrate_webhook_database(database_path)
 
-    assert read_user_version(database_path) == 2
+    assert read_user_version(database_path) == 3
 
     with sqlite3.connect(database_path) as connection:
         columns = {
@@ -519,7 +531,8 @@ def test_version_one_database_upgrades_to_version_two(
         }
         row = connection.execute(
             """
-            SELECT operation_key, status, updated_at, review_contract_version
+            SELECT operation_key, status, updated_at, review_contract_version,
+                   input_fingerprint
             FROM ai_operations
             WHERE operation_key = 'existing-operation'
             """
@@ -532,7 +545,9 @@ def test_version_one_database_upgrades_to_version_two(
         "SUCCEEDED",
         "2026-01-01T00:00:00+00:00",
         "review-v1",
+        None,
     )
+    assert "input_fingerprint" in columns
 
 
 def test_review_contract_version_column_exists_with_default(
@@ -554,7 +569,7 @@ def test_review_contract_version_column_exists_with_default(
     assert column[4] == "'review-v1'"
 
 
-def test_existing_operation_row_preserves_data_and_receives_default(
+def test_existing_operation_row_preserves_data_and_receives_legacy_defaults(
     tmp_path: Path,
 ) -> None:
     database_path = tmp_path / "webhook.sqlite3"
@@ -628,12 +643,12 @@ def test_existing_operation_row_preserves_data_and_receives_default(
 
     assert original_row is not None
     assert row is not None
-    assert row[:-1] == original_row
-    assert columns[-1] == "review_contract_version"
-    assert row[-1] == "review-v1"
+    assert row[:-2] == original_row
+    assert columns[-2:] == ["review_contract_version", "input_fingerprint"]
+    assert row[-2:] == ("review-v1", None)
 
 
-def test_existing_indexes_remain_intact_after_v2(tmp_path: Path) -> None:
+def test_existing_indexes_remain_intact_after_v3(tmp_path: Path) -> None:
     database_path = tmp_path / "webhook.sqlite3"
     create_version_one_database(database_path)
 
@@ -658,6 +673,53 @@ def test_existing_indexes_remain_intact_after_v2(tmp_path: Path) -> None:
         "pull_number",
         "head_sha",
     ]
+
+
+def test_version_two_database_upgrades_without_fingerprinting_legacy_rows(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "webhook.sqlite3"
+    create_version_two_database(database_path)
+    insert_operation(database_path, pull_number=42, status="SUCCEEDED")
+
+    migrate_webhook_database(database_path)
+
+    assert read_user_version(database_path) == 3
+    with sqlite3.connect(database_path) as connection:
+        row = connection.execute(
+            """
+            SELECT operation_key, status, input_fingerprint
+            FROM ai_operations
+            WHERE operation_key = 'operation-key'
+            """
+        ).fetchone()
+        columns = {
+            column[1]: column
+            for column in connection.execute("PRAGMA table_info(ai_operations)")
+        }
+
+    assert row == ("operation-key", "SUCCEEDED", None)
+    assert columns["input_fingerprint"][2] == "TEXT"
+    assert columns["input_fingerprint"][3] == 0
+    assert columns["input_fingerprint"][4] is None
+
+
+def test_version_three_database_migration_is_a_no_op(tmp_path: Path) -> None:
+    database_path = tmp_path / "webhook.sqlite3"
+    migrate_webhook_database(database_path)
+
+    with sqlite3.connect(database_path) as connection:
+        original_columns = connection.execute(
+            "PRAGMA table_info(ai_operations)"
+        ).fetchall()
+
+    migrate_webhook_database(database_path)
+
+    with sqlite3.connect(database_path) as connection:
+        columns = connection.execute("PRAGMA table_info(ai_operations)").fetchall()
+
+    assert columns == original_columns
+    assert read_user_version(database_path) == 3
 
 
 def test_v2_migration_failure_rolls_back_column_and_version(
@@ -691,3 +753,35 @@ def test_v2_migration_failure_rolls_back_column_and_version(
 
     assert "review_contract_version" not in columns
     assert read_user_version(database_path) == 1
+
+
+def test_v3_migration_failure_rolls_back_column_and_version(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import codeguard.webhooks.schema_migrations as migrations
+
+    database_path = tmp_path / "webhook.sqlite3"
+    create_version_two_database(database_path)
+    real_apply_migration_v3 = migrations._apply_migration_v3
+
+    def fail_after_real_migration(connection: sqlite3.Connection) -> None:
+        real_apply_migration_v3(connection)
+        raise RuntimeError("simulated v3 migration failure")
+
+    monkeypatch.setattr(
+        migrations,
+        "_apply_migration_v3",
+        fail_after_real_migration,
+    )
+
+    with pytest.raises(RuntimeError, match="simulated v3 migration failure"):
+        migrate_webhook_database(database_path)
+
+    with sqlite3.connect(database_path) as connection:
+        columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(ai_operations)")
+        }
+
+    assert "input_fingerprint" not in columns
+    assert read_user_version(database_path) == 2

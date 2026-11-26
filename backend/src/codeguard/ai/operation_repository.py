@@ -15,14 +15,18 @@ from typing import cast
 
 from codeguard.ai.exceptions import AIRequestTransmissionState
 from codeguard.ai.operation_identity import (
-    AI_OPERATION_FORMAT_VERSION,
+    AI_OPERATION_V1_FORMAT_VERSION,
+    AI_OPERATION_V2_FORMAT_VERSION,
     AIOperationIdentity,
+    LegacyAIOperationIdentity,
     build_ai_operation_key,
+    build_legacy_ai_operation_key,
 )
 
 _DATABASE_TIMEOUT_SECONDS = 5.0
 _OPERATION_KEY_PATTERN = re.compile(
-    rf"{re.escape(AI_OPERATION_FORMAT_VERSION)}:[0-9a-f]{{64}}\Z"
+    rf"(?:{re.escape(AI_OPERATION_V1_FORMAT_VERSION)}|"
+    rf"{re.escape(AI_OPERATION_V2_FORMAT_VERSION)}):[0-9a-f]{{64}}\Z"
 )
 
 
@@ -53,7 +57,7 @@ class AIOperationRecord:
     """A typed snapshot of one persisted AI operation."""
 
     operation_key: str
-    identity: AIOperationIdentity
+    identity: AIOperationIdentity | LegacyAIOperationIdentity
     status: AIOperationStatus
     lease_expires_at: str | None
     provider_request_started_at: str | None
@@ -93,6 +97,33 @@ def _validate_operation_key(operation_key: str) -> None:
 
 def _optional_string(value: object) -> str | None:
     return str(value) if value is not None else None
+
+
+def _identity_values_from_row(
+    row: sqlite3.Row,
+) -> tuple[str, str, int, str, str, str, str, str, str, str]:
+    pull_number = row["pull_number"]
+    if isinstance(pull_number, bool) or not isinstance(pull_number, int):
+        raise ValueError("Stored pull number is invalid.")
+    return (
+        _identity_string_from_row(row, "owner"),
+        _identity_string_from_row(row, "repo"),
+        pull_number,
+        _identity_string_from_row(row, "head_sha"),
+        _identity_string_from_row(row, "provider_identity"),
+        _identity_string_from_row(row, "model_identity"),
+        _identity_string_from_row(row, "prompt_contract_version"),
+        _identity_string_from_row(row, "context_contract_version"),
+        _identity_string_from_row(row, "evidence_contract_version"),
+        _identity_string_from_row(row, "review_contract_version"),
+    )
+
+
+def _identity_string_from_row(row: sqlite3.Row, field_name: str) -> str:
+    value = row[field_name]
+    if not isinstance(value, str):
+        raise ValueError("Stored identity string is invalid.")
+    return value
 
 
 class AIOperationRepository:
@@ -152,7 +183,38 @@ class AIOperationRepository:
 
     @staticmethod
     def _record_from_row(row: sqlite3.Row) -> AIOperationRecord:
-        status_value = str(row["status"])
+        operation_key = row["operation_key"]
+        if not isinstance(operation_key, str):
+            raise AIOperationRepositoryError("Stored AI operation key is invalid.")
+        try:
+            _validate_operation_key(operation_key)
+        except ValueError:
+            raise AIOperationRepositoryError(
+                "Stored AI operation key is invalid."
+            ) from None
+
+        key_version = operation_key.partition(":")[0]
+        fingerprint = row["input_fingerprint"]
+
+        if key_version == AI_OPERATION_V1_FORMAT_VERSION:
+            if fingerprint is not None:
+                raise AIOperationRepositoryError(
+                    "Legacy AI operation has an unexpected fingerprint."
+                )
+        else:
+            if fingerprint is None:
+                raise AIOperationRepositoryError(
+                    "Version 2 AI operation is missing its input fingerprint."
+                )
+            if not isinstance(fingerprint, str):
+                raise AIOperationRepositoryError(
+                    "Stored AI operation fingerprint is invalid."
+                )
+
+        status_value = row["status"]
+        if not isinstance(status_value, str):
+            raise AIOperationRepositoryError("Stored AI operation status is invalid.")
+        identity: AIOperationIdentity | LegacyAIOperationIdentity
         try:
             status = AIOperationStatus(status_value)
         except ValueError:
@@ -161,25 +223,65 @@ class AIOperationRepository:
             ) from None
 
         try:
-            identity = AIOperationIdentity(
-                owner=str(row["owner"]),
-                repo=str(row["repo"]),
-                pull_number=int(row["pull_number"]),
-                head_sha=str(row["head_sha"]),
-                provider_identity=str(row["provider_identity"]),
-                model_identity=str(row["model_identity"]),
-                prompt_contract_version=str(row["prompt_contract_version"]),
-                context_contract_version=str(row["context_contract_version"]),
-                evidence_contract_version=str(row["evidence_contract_version"]),
-                review_contract_version=str(row["review_contract_version"]),
-            )
-        except (TypeError, ValueError):
+            (
+                owner,
+                repo,
+                pull_number,
+                head_sha,
+                provider_identity,
+                model_identity,
+                prompt_contract_version,
+                context_contract_version,
+                evidence_contract_version,
+                review_contract_version,
+            ) = _identity_values_from_row(row)
+            if key_version == AI_OPERATION_V2_FORMAT_VERSION:
+                if not isinstance(fingerprint, str):
+                    raise ValueError("Stored AI operation fingerprint is invalid.")
+                identity = AIOperationIdentity(
+                    owner=owner,
+                    repo=repo,
+                    pull_number=pull_number,
+                    head_sha=head_sha,
+                    provider_identity=provider_identity,
+                    model_identity=model_identity,
+                    prompt_contract_version=prompt_contract_version,
+                    context_contract_version=context_contract_version,
+                    evidence_contract_version=evidence_contract_version,
+                    review_contract_version=review_contract_version,
+                    input_fingerprint=fingerprint,
+                )
+                expected_key = build_ai_operation_key(identity)
+            else:
+                identity = LegacyAIOperationIdentity(
+                    owner=owner,
+                    repo=repo,
+                    pull_number=pull_number,
+                    head_sha=head_sha,
+                    provider_identity=provider_identity,
+                    model_identity=model_identity,
+                    prompt_contract_version=prompt_contract_version,
+                    context_contract_version=context_contract_version,
+                    evidence_contract_version=evidence_contract_version,
+                    review_contract_version=review_contract_version,
+                )
+                expected_key = build_legacy_ai_operation_key(identity)
+        except (TypeError, ValueError, UnicodeError, OverflowError):
             raise AIOperationRepositoryError(
                 "Stored AI operation identity is invalid."
             ) from None
 
+        if expected_key != operation_key:
+            raise AIOperationRepositoryError(
+                "Stored AI operation key does not match its identity."
+            )
+
+        result_json = row["result_json"]
+        if result_json is not None and not isinstance(result_json, str):
+            raise AIOperationRepositoryError("Stored AI operation result is invalid.")
+
         return AIOperationRecord(
-            operation_key=str(row["operation_key"]),
+            operation_key=operation_key,
             identity=identity,
             status=status,
             lease_expires_at=_optional_string(row["lease_expires_at"]),
@@ -196,7 +298,7 @@ class AIOperationRepository:
                 if row["serialization_version"] is not None
                 else None
             ),
-            result_json=_optional_string(row["result_json"]),
+            result_json=result_json,
             provider_request_id=_optional_string(row["provider_request_id"]),
             disposition=_optional_string(row["disposition"]),
             safe_error=_optional_string(row["safe_error"]),
@@ -209,10 +311,16 @@ class AIOperationRepository:
         record: AIOperationRecord,
         identity: AIOperationIdentity,
     ) -> bool:
-        return record.identity == identity
+        return (
+            isinstance(record.identity, AIOperationIdentity)
+            and record.identity == identity
+        )
 
     def create_or_get(self, identity: AIOperationIdentity) -> AIOperationRecord:
         """Create a pending operation or return its existing matching record."""
+
+        if not isinstance(identity, AIOperationIdentity):
+            raise TypeError("New AI operations require an AIOperationIdentity v2.")
 
         operation_key = build_ai_operation_key(identity)
         now_text = _timestamp(_utc_now())
@@ -225,9 +333,10 @@ class AIOperationRepository:
                     operation_key, owner, repo, pull_number, head_sha,
                     provider_identity, model_identity, prompt_contract_version,
                     context_contract_version, evidence_contract_version,
-                    review_contract_version, status, created_at, updated_at
+                    review_contract_version, input_fingerprint, status,
+                    created_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(operation_key) DO NOTHING
                 """,
                 (
@@ -242,6 +351,7 @@ class AIOperationRepository:
                     identity.context_contract_version,
                     identity.evidence_contract_version,
                     identity.review_contract_version,
+                    identity.input_fingerprint,
                     AIOperationStatus.PENDING.value,
                     now_text,
                     now_text,
@@ -320,6 +430,10 @@ class AIOperationRepository:
             if row is None:
                 raise AIOperationRepositoryError("AI operation does not exist.")
             record = self._record_from_row(row)
+            if not isinstance(record.identity, AIOperationIdentity):
+                raise AIOperationRepositoryError(
+                    "Legacy AI operations cannot be claimed."
+                )
 
             if record.status is AIOperationStatus.PENDING:
                 can_claim = True
@@ -589,6 +703,17 @@ class AIOperationRepository:
 
         with self._connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            existing_row = connection.execute(
+                "SELECT * FROM ai_operations WHERE operation_key = ?",
+                (operation_key,),
+            ).fetchone()
+            if existing_row is not None:
+                existing_record = self._record_from_row(existing_row)
+                if not isinstance(existing_record.identity, AIOperationIdentity):
+                    raise AIOperationRepositoryError(
+                        "Legacy AI operations cannot be transitioned."
+                    )
+
             now_text = _timestamp(_utc_now())
             parameters = (
                 *((now_text,) if timestamp_assignment is not None else ()),

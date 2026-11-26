@@ -4,8 +4,12 @@ import pytest
 
 from codeguard.ai.operation_identity import (
     AIOperationIdentity,
+    LegacyAIOperationIdentity,
     build_ai_operation_key,
+    build_legacy_ai_operation_key,
 )
+
+VALID_FINGERPRINT = "ai-execution-input-v1:" + "f" * 64
 
 
 def make_identity(**updates: object) -> AIOperationIdentity:
@@ -20,15 +24,70 @@ def make_identity(**updates: object) -> AIOperationIdentity:
         "context_contract_version": "context-v1",
         "evidence_contract_version": "evidence-v1",
         "review_contract_version": "review-v1",
+        "input_fingerprint": VALID_FINGERPRINT,
     }
     values.update(updates)
     return AIOperationIdentity(**values)  # type: ignore[arg-type]
+
+
+def make_legacy_identity(**updates: object) -> LegacyAIOperationIdentity:
+    values: dict[str, object] = {
+        "owner": "octocat",
+        "repo": "CodeGuard",
+        "pull_number": 42,
+        "head_sha": "ABCDEF123456",
+        "provider_identity": "provider-openai-compatible",
+        "model_identity": "model-review-v1",
+        "prompt_contract_version": "prompt-v1",
+        "context_contract_version": "context-v1",
+        "evidence_contract_version": "evidence-v1",
+        "review_contract_version": "review-v1",
+    }
+    values.update(updates)
+    return LegacyAIOperationIdentity(**values)  # type: ignore[arg-type]
 
 
 def test_identical_identities_produce_identical_keys() -> None:
     identity = make_identity()
 
     assert build_ai_operation_key(identity) == build_ai_operation_key(make_identity())
+
+
+def test_v2_operation_keys_have_the_new_versioned_format() -> None:
+    key = build_ai_operation_key(make_identity())
+
+    assert key.startswith("ai-operation-v2:")
+    assert len(key.removeprefix("ai-operation-v2:")) == 64
+    assert all(character in "0123456789abcdef" for character in key.split(":")[1])
+
+
+def test_legacy_v1_canonicalization_matches_the_previous_key() -> None:
+    identity = make_legacy_identity()
+
+    assert build_legacy_ai_operation_key(identity) == (
+        "ai-operation-v1:"
+        "e67710e5d0fe568fd6b95073c15e51e1d00f133db280eadadfd0c2b8d43a01ad"
+    )
+
+
+def test_fingerprint_changes_the_v2_operation_key() -> None:
+    assert build_ai_operation_key(make_identity()) != build_ai_operation_key(
+        make_identity(input_fingerprint="ai-execution-input-v1:" + "e" * 64)
+    )
+
+
+@pytest.mark.parametrize(
+    "fingerprint",
+    [
+        "",
+        "ai-execution-input-v1:" + "F" * 64,
+        "ai-execution-input-v2:" + "f" * 64,
+        "ai-execution-input-v1:" + "f" * 63,
+    ],
+)
+def test_invalid_input_fingerprints_are_rejected(fingerprint: str) -> None:
+    with pytest.raises(ValueError, match="input_fingerprint"):
+        make_identity(input_fingerprint=fingerprint)
 
 
 def test_owner_and_repository_casing_is_normalized() -> None:
@@ -118,6 +177,7 @@ def test_different_review_contract_versions_produce_different_keys() -> None:
         ("context_contract_version", " ", "context_contract_version"),
         ("evidence_contract_version", "", "evidence_contract_version"),
         ("review_contract_version", " ", "review_contract_version"),
+        ("input_fingerprint", "", "input_fingerprint"),
     ],
 )
 def test_invalid_identity_fields_are_rejected(
@@ -161,6 +221,8 @@ def test_boolean_pull_number_is_rejected() -> None:
         ("evidence_contract_version", 123),
         ("review_contract_version", None),
         ("review_contract_version", 123),
+        ("input_fingerprint", None),
+        ("input_fingerprint", 123),
     ],
 )
 def test_string_fields_reject_invalid_runtime_types(
