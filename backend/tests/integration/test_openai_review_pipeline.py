@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -32,10 +34,12 @@ from codeguard.github.schemas import (
 )
 from codeguard.review.report_builder import build_review_report
 from codeguard.services.pull_request_analyzer import PullRequestAnalyzer
+from codeguard.services.webhook_job_worker import WebhookJobWorker
 from codeguard.services.webhook_review_processor import (
     ReviewPublishResult,
     WebhookReviewProcessor,
 )
+from codeguard.webhooks.job_queue import WebhookJobQueue
 from codeguard.webhooks.schema_migrations import migrate_webhook_database
 
 OWNER = "octocat"
@@ -54,6 +58,7 @@ PATCH = (
 )
 TEST_API_KEY = "test-openai-key-not-a-real-credential"
 TEST_MODEL = "gpt-test-model"
+ProviderResponseHandler = Callable[[httpx.Request], httpx.Response]
 
 
 def make_pull_request(head_sha: str = HEAD_SHA) -> GitHubPullRequest:
@@ -259,6 +264,7 @@ def make_harness(
     candidate: AIFindingCandidate,
     commit_sha_override: str | None = None,
     missing_source_paths: tuple[str, ...] = (),
+    provider_response_handler: ProviderResponseHandler | None = None,
 ) -> OpenAIReviewHarness:
     migrate_webhook_database(database_path)
     requests: list[httpx.Request] = []
@@ -266,6 +272,8 @@ def make_harness(
 
     def handle_provider_request(request: httpx.Request) -> httpx.Response:
         requests.append(request)
+        if provider_response_handler is not None:
+            return provider_response_handler(request)
         return httpx.Response(200, json=response_body, request=request)
 
     provider = OpenAIReviewProvider(
@@ -487,6 +495,329 @@ async def test_uneligible_ai_candidates_never_become_review_comments(
         assert len(read_operations(database_path)) == 1
         assert harness.github_client.review_lookup_calls == 0
         assert harness.github_client.review_creation_calls == 0
+    finally:
+        await harness.selection.aclose()
+
+
+@pytest.mark.asyncio
+async def test_worker_retries_confirmed_not_sent_failure_and_completes(
+    tmp_path: Path,
+) -> None:
+    candidate = make_candidate()
+    provider_calls = 0
+
+    def provider_response_handler(request: httpx.Request) -> httpx.Response:
+        nonlocal provider_calls
+        provider_calls += 1
+        if provider_calls == 1:
+            raise httpx.ConnectError("private connection detail", request=request)
+        return httpx.Response(
+            200,
+            json=make_responses_api_body(candidate),
+            request=request,
+        )
+
+    database_path = tmp_path / "openai-worker-safe-retry.sqlite3"
+    harness = make_harness(
+        database_path,
+        candidate=candidate,
+        provider_response_handler=provider_response_handler,
+    )
+    queue = WebhookJobQueue(database_path)
+    queue.enqueue_job(
+        delivery_id="openai-safe-retry",
+        event="pull_request",
+        action="opened",
+        owner=OWNER,
+        repo=REPO,
+        pull_number=PULL_NUMBER,
+    )
+    worker = WebhookJobWorker(
+        queue=queue,
+        processor=harness.processor,
+        max_attempts=2,
+        retry_delay_seconds=0,
+        lease_seconds=10,
+    )
+
+    try:
+        assert await worker.run_once() is True
+        queued = queue.get_job("openai-safe-retry")
+        assert queued is not None
+        assert queued.status == "queued"
+        assert queued.attempts == 1
+        assert "AIExecutionRetryableError" in (queued.last_error or "")
+
+        pending_operations = read_operations(database_path)
+        assert len(pending_operations) == 1
+        operation_key, operation_status = pending_operations[0]
+        assert operation_status == AIOperationStatus.PENDING.value
+        pending = harness.repository.get(operation_key)
+        assert pending is not None
+        assert pending.lease_expires_at is None
+        assert pending.provider_request_started_at is None
+
+        assert await worker.run_once() is True
+        completed = queue.get_job("openai-safe-retry")
+        assert completed is not None
+        assert completed.status == "completed"
+        assert completed.attempts == 2
+        assert harness.repository.get(operation_key).status is (  # type: ignore[union-attr]
+            AIOperationStatus.SUCCEEDED
+        )
+        assert len(harness.requests) == 2
+    finally:
+        await harness.selection.aclose()
+
+
+@pytest.mark.asyncio
+async def test_safe_not_sent_retries_stop_at_webhook_attempt_limit(
+    tmp_path: Path,
+) -> None:
+    def provider_response_handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("private connection detail", request=request)
+
+    database_path = tmp_path / "openai-worker-retry-limit.sqlite3"
+    harness = make_harness(
+        database_path,
+        candidate=make_candidate(),
+        provider_response_handler=provider_response_handler,
+    )
+    queue = WebhookJobQueue(database_path)
+    queue.enqueue_job(
+        delivery_id="openai-safe-retry-limit",
+        event="pull_request",
+        action="opened",
+        owner=OWNER,
+        repo=REPO,
+        pull_number=PULL_NUMBER,
+    )
+    worker = WebhookJobWorker(
+        queue=queue,
+        processor=harness.processor,
+        max_attempts=2,
+        retry_delay_seconds=0,
+        lease_seconds=10,
+    )
+
+    try:
+        assert await worker.run_once() is True
+        assert await worker.run_once() is True
+
+        failed = queue.get_job("openai-safe-retry-limit")
+        assert failed is not None
+        assert failed.status == "failed"
+        assert failed.attempts == 2
+        assert await worker.run_once() is False
+        assert len(harness.requests) == 2
+        operation_key, operation_status = read_operations(database_path)[0]
+        assert operation_status == AIOperationStatus.PENDING.value
+        assert harness.repository.get(operation_key).status is (  # type: ignore[union-attr]
+            AIOperationStatus.PENDING
+        )
+    finally:
+        await harness.selection.aclose()
+
+
+@pytest.mark.parametrize(
+    ("failure_case", "expected_operation_status", "expected_diagnostic_parts"),
+    [
+        (
+            "read_timeout",
+            AIOperationStatus.OUTCOME_UNKNOWN,
+            ("AIExecutionOutcomeUnknownError",),
+        ),
+        (
+            "write_timeout",
+            AIOperationStatus.OUTCOME_UNKNOWN,
+            ("AIExecutionOutcomeUnknownError",),
+        ),
+        (
+            "authentication",
+            AIOperationStatus.FAILED_PERMANENT,
+            ("AIExecutionPermanentFailureError", "status=401"),
+        ),
+        (
+            "permission",
+            AIOperationStatus.FAILED_PERMANENT,
+            ("AIExecutionPermanentFailureError", "status=403"),
+        ),
+        (
+            "malformed_response",
+            AIOperationStatus.FAILED_PERMANENT,
+            ("AIExecutionPermanentFailureError", "status=200"),
+        ),
+        (
+            "rate_limit",
+            AIOperationStatus.OUTCOME_UNKNOWN,
+            (
+                "AIExecutionOutcomeUnknownError",
+                "status=429",
+                "request_id=rate_limit_request-123",
+                "retry_after_seconds=2.5",
+            ),
+        ),
+        (
+            "server_error",
+            AIOperationStatus.OUTCOME_UNKNOWN,
+            ("AIExecutionOutcomeUnknownError", "status=503"),
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_worker_persists_provider_failure_disposition_without_unsafe_retry(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    failure_case: str,
+    expected_operation_status: AIOperationStatus,
+    expected_diagnostic_parts: tuple[str, ...],
+) -> None:
+    private_response = "private provider response body and secret credential"
+
+    def provider_response_handler(request: httpx.Request) -> httpx.Response:
+        if failure_case == "read_timeout":
+            raise httpx.ReadTimeout(private_response, request=request)
+        if failure_case == "write_timeout":
+            raise httpx.WriteTimeout(private_response, request=request)
+        if failure_case == "malformed_response":
+            return httpx.Response(
+                200,
+                content=private_response.encode(),
+                headers={"x-request-id": "malformed-request-123"},
+                request=request,
+            )
+
+        status_code = {
+            "authentication": 401,
+            "permission": 403,
+            "rate_limit": 429,
+            "server_error": 503,
+        }[failure_case]
+        headers = {"x-request-id": f"{failure_case}/request-123"}
+        if failure_case == "rate_limit":
+            headers["Retry-After"] = "2.5"
+        return httpx.Response(
+            status_code,
+            content=private_response.encode(),
+            headers=headers,
+            request=request,
+        )
+
+    database_path = tmp_path / f"openai-worker-{failure_case}.sqlite3"
+    harness = make_harness(
+        database_path,
+        candidate=make_candidate(),
+        provider_response_handler=provider_response_handler,
+    )
+    queue = WebhookJobQueue(database_path)
+    delivery_id = f"openai-failure-{failure_case}"
+    queue.enqueue_job(
+        delivery_id=delivery_id,
+        event="pull_request",
+        action="opened",
+        owner=OWNER,
+        repo=REPO,
+        pull_number=PULL_NUMBER,
+    )
+    worker = WebhookJobWorker(
+        queue=queue,
+        processor=harness.processor,
+        max_attempts=5,
+        retry_delay_seconds=0,
+        lease_seconds=10,
+    )
+
+    try:
+        with caplog.at_level(logging.ERROR):
+            assert await worker.run_once() is True
+
+        failed_job = queue.get_job(delivery_id)
+        assert failed_job is not None
+        assert failed_job.status == "failed"
+        assert failed_job.attempts == 1
+        assert failed_job.last_error is not None
+        for expected_part in expected_diagnostic_parts:
+            assert expected_part in failed_job.last_error
+
+        operations = read_operations(database_path)
+        assert len(operations) == 1
+        operation_key, operation_status = operations[0]
+        assert operation_status == expected_operation_status.value
+        assert await worker.run_once() is False
+        assert len(harness.requests) == 1
+
+        assert private_response not in failed_job.last_error
+        assert private_response not in caplog.text
+        assert TEST_API_KEY not in failed_job.last_error
+        assert TEST_API_KEY not in caplog.text
+        assert queue.claim_next_job(max_attempts=5) is None
+
+        if failure_case == "rate_limit":
+            assert "retry_after_seconds=2.5" in failed_job.last_error
+    finally:
+        await harness.selection.aclose()
+
+
+@pytest.mark.asyncio
+async def test_expired_webhook_lease_reuses_persisted_ai_result(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "openai-expired-webhook-lease.sqlite3"
+    harness = make_harness(
+        database_path,
+        candidate=make_candidate(),
+    )
+    queue = WebhookJobQueue(database_path)
+    queue.enqueue_job(
+        delivery_id="openai-expired-lease",
+        event="pull_request",
+        action="opened",
+        owner=OWNER,
+        repo=REPO,
+        pull_number=PULL_NUMBER,
+    )
+    first_claim = queue.claim_next_job(lease_seconds=10, max_attempts=3)
+    assert first_claim is not None
+    assert first_claim.attempts == 1
+
+    try:
+        first_result = await harness.processor.process(
+            owner=OWNER,
+            repo=REPO,
+            pull_number=PULL_NUMBER,
+        )
+        assert first_result.status == "dry_run"
+        assert len(harness.requests) == 1
+
+        with sqlite3.connect(database_path) as connection:
+            connection.execute(
+                """
+                UPDATE webhook_jobs
+                SET lease_expires_at = ?
+                WHERE delivery_id = ?
+                """,
+                ("2000-01-01T00:00:00+00:00", "openai-expired-lease"),
+            )
+
+        worker = WebhookJobWorker(
+            queue=queue,
+            processor=harness.processor,
+            max_attempts=3,
+            retry_delay_seconds=0,
+            lease_seconds=10,
+        )
+        assert await worker.run_once() is True
+
+        recovered_job = queue.get_job("openai-expired-lease")
+        assert recovered_job is not None
+        assert recovered_job.status == "completed"
+        assert recovered_job.attempts == 2
+        assert len(harness.requests) == 1
+        operation_key, operation_status = read_operations(database_path)[0]
+        assert operation_status == AIOperationStatus.SUCCEEDED.value
+        assert harness.repository.get(operation_key).status is (  # type: ignore[union-attr]
+            AIOperationStatus.SUCCEEDED
+        )
     finally:
         await harness.selection.aclose()
 

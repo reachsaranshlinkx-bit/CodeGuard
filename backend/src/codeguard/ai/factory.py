@@ -122,6 +122,7 @@ def create_ai_review_provider_selection(
         openai_provider = OpenAIReviewProvider(
             model_identity=settings.openai_model,
             api_key=settings.openai_api_key,
+            timeout=settings.openai_request_timeout_seconds,
         )
         return AIReviewProviderSelection(
             provider=openai_provider,

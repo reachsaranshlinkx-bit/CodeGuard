@@ -1,8 +1,9 @@
+import math
 from functools import lru_cache
 from pathlib import Path
 from typing import Literal
 
-from pydantic import SecretStr, model_validator
+from pydantic import SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 Environment = Literal[
@@ -37,11 +38,14 @@ class Settings(BaseSettings):
     api_key: SecretStr | None = None
     openai_api_key: SecretStr | None = None
     openai_model: str | None = None
+    openai_request_timeout_seconds: float = 30.0
     webhook_database_path: Path = Path("data/webhook_deliveries.sqlite3")
     github_webhook_secret: SecretStr | None = None
     enable_review_publishing: bool = False
     webhook_worker_enabled: bool = False
     webhook_worker_poll_interval_seconds: int = 1
+    webhook_worker_max_attempts: int = 5
+    webhook_worker_retry_delay_seconds: int = 30
 
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -51,12 +55,46 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
+    @field_validator(
+        "openai_request_timeout_seconds",
+        "webhook_worker_max_attempts",
+        "webhook_worker_retry_delay_seconds",
+        mode="before",
+    )
+    @classmethod
+    def reject_boolean_retry_configuration(cls, value: object) -> object:
+        """Do not accept booleans as numeric timeout or retry controls."""
+
+        if isinstance(value, bool):
+            raise ValueError("Numeric timeout and retry settings cannot be booleans.")
+        return value
+
     @model_validator(mode="after")
     def validate_production_settings(self) -> "Settings":
         """Enforce required configuration in production."""
         if self.webhook_worker_poll_interval_seconds < 1:
             raise ValueError(
                 "CODEGUARD_WEBHOOK_WORKER_POLL_INTERVAL_SECONDS must be at least 1."
+            )
+
+        try:
+            timeout_is_finite = math.isfinite(self.openai_request_timeout_seconds)
+        except OverflowError:
+            timeout_is_finite = False
+        if not timeout_is_finite or self.openai_request_timeout_seconds <= 0:
+            raise ValueError(
+                "CODEGUARD_OPENAI_REQUEST_TIMEOUT_SECONDS must be finite "
+                "and greater than zero."
+            )
+
+        if self.webhook_worker_max_attempts < 1:
+            raise ValueError(
+                "CODEGUARD_WEBHOOK_WORKER_MAX_ATTEMPTS must be at least 1."
+            )
+
+        if self.webhook_worker_retry_delay_seconds < 0:
+            raise ValueError(
+                "CODEGUARD_WEBHOOK_WORKER_RETRY_DELAY_SECONDS must be non-negative."
             )
 
         if self.ai_provider == "mock" and self.environment not in (

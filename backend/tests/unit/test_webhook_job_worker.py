@@ -547,6 +547,36 @@ async def test_ai_diagnostic_preserves_safe_metadata_and_hides_sensitive_chain(
     assert secret not in caplog.text
 
 
+async def test_rate_limit_diagnostic_preserves_bounded_retry_metadata(
+    queue: WebhookJobQueue,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    enqueue_test_job(queue)
+    secret = "private-rate-limit-response-detail"
+    provider_error = AIProviderRateLimitError(
+        "Provider rate limit reached.",
+        status_code=429,
+        request_id="rate-limit-request-123",
+        retry_after=2.5,
+    )
+    provider_error.__cause__ = RuntimeError(secret)
+    processor = AsyncMock()
+    processor.process.side_effect = provider_error
+    worker = WebhookJobWorker(queue=queue, processor=processor)
+
+    with caplog.at_level(logging.ERROR):
+        await worker.run_once()
+
+    saved = queue.get_job("delivery-worker-001")
+    assert saved is not None
+    assert saved.status == "failed"
+    assert "status=429" in (saved.last_error or "")
+    assert "request_id=rate-limit-request-123" in (saved.last_error or "")
+    assert "retry_after_seconds=2.5" in (saved.last_error or "")
+    assert secret not in (saved.last_error or "")
+    assert secret not in caplog.text
+
+
 async def test_not_sent_ai_failure_respects_maximum_attempts(
     queue: WebhookJobQueue,
 ) -> None:

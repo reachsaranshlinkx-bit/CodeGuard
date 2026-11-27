@@ -2,10 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 
 from codeguard.ai.exceptions import (
     AIProviderError,
     AIProviderFailureDisposition,
+    AIProviderHTTPError,
+    AIProviderRateLimitError,
+    AIProviderResponseError,
     classify_ai_provider_error,
 )
 from codeguard.ai.execution_coordinator import (
@@ -256,13 +260,17 @@ class WebhookJobWorker:
 
         request_id = getattr(error, "request_id", None)
         if isinstance(request_id, str) and request_id.strip():
-            safe_request_id = "".join(
-                character
-                if character.isprintable() and character not in "\r\n"
-                else "_"
-                for character in request_id.strip()
-            )[:200]
+            safe_request_id = WebhookJobWorker._safe_diagnostic_value(
+                request_id,
+                limit=200,
+            )
             parts.append(f"request_id={safe_request_id}")
+
+        if (
+            isinstance(error, AIProviderRateLimitError)
+            and error.retry_after is not None
+        ):
+            parts.append(f"retry_after_seconds={error.retry_after:.6g}")
 
         return " ".join(parts)
 
@@ -306,7 +314,41 @@ class WebhookJobWorker:
                 "note=webhook_budget_exhaustion_does_not_change_ai_operation_state"
             )
 
+        parts.extend(
+            WebhookJobWorker._provider_failure_metadata_diagnostic(error.__cause__)
+        )
         return " ".join(parts)
+
+    @staticmethod
+    def _provider_failure_metadata_diagnostic(
+        cause: BaseException | None,
+    ) -> list[str]:
+        """Retain bounded provider correlation and rate-limit metadata only."""
+
+        if not isinstance(cause, (AIProviderHTTPError, AIProviderResponseError)):
+            return []
+
+        parts: list[str] = []
+        status_code = cause.status_code
+        if isinstance(status_code, int) and not isinstance(status_code, bool):
+            parts.append(f"status={status_code}")
+        if cause.request_id:
+            request_id = WebhookJobWorker._safe_diagnostic_value(
+                cause.request_id,
+                limit=100,
+            )
+            if request_id:
+                parts.append(f"request_id={request_id}")
+
+        if (
+            isinstance(cause, AIProviderRateLimitError)
+            and cause.retry_after is not None
+            and math.isfinite(cause.retry_after)
+            and cause.retry_after >= 0
+        ):
+            parts.append(f"retry_after_seconds={cause.retry_after:.6g}")
+
+        return parts
 
     @staticmethod
     def _safe_diagnostic_value(value: str, *, limit: int) -> str:
