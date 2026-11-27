@@ -3,10 +3,18 @@
 from __future__ import annotations
 
 from datetime import datetime
+from decimal import Decimal
 from typing import Annotated
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from codeguard.ai.telemetry import (
+    AICostMetrics,
+    AIDurationMetrics,
+    AIPerformanceMetrics,
+    AITokenUsageMetrics,
+    aggregate_ai_telemetry,
+)
 from codeguard.evaluation.contracts import (
     CaseIdentifier,
     EvaluationRun,
@@ -54,6 +62,9 @@ class EvaluationReport(_ReportModel):
     dataset_scope_statement: NonBlankText
     case_limitations: tuple[EvaluationCaseLimitations, ...]
     metrics: EvaluationMetrics
+    performance_metrics: AIPerformanceMetrics | None = None
+    token_usage_metrics: AITokenUsageMetrics | None = None
+    cost_metrics: AICostMetrics | None = None
 
     @model_validator(mode="after")
     def validate_report_references(self) -> EvaluationReport:
@@ -91,6 +102,12 @@ def build_evaluation_report(run: EvaluationRun) -> EvaluationReport:
     """Calculate metrics and preserve metadata and limitations from the run."""
 
     metrics = calculate_evaluation_metrics(run)
+    performance, tokens, costs = aggregate_ai_telemetry(
+        (result.ai_telemetry for result in run.results),
+        pricing=run.pricing_configuration,
+        reviewed_pr_count=len(run.results),
+        verified_finding_count=metrics.true_positives,
+    )
     return EvaluationReport(
         evaluation_run_id=run.run_id,
         dataset_id=run.dataset.dataset_id,
@@ -108,6 +125,9 @@ def build_evaluation_report(run: EvaluationRun) -> EvaluationReport:
             for case in run.dataset.cases
         ),
         metrics=metrics,
+        performance_metrics=performance,
+        token_usage_metrics=tokens,
+        cost_metrics=costs,
     )
 
 
@@ -179,6 +199,18 @@ def render_markdown_report(report: EvaluationReport) -> str:
             recommendations.micro_averaged,
             recommendations.macro_averaged,
         ),
+        "",
+        "## AI performance",
+        "",
+        _render_performance(report.performance_metrics),
+        "",
+        "## AI token usage",
+        "",
+        _render_token_usage(report.token_usage_metrics),
+        "",
+        "## AI cost estimate",
+        "",
+        _render_cost(report.cost_metrics),
         "",
         "## Per-case results",
         "",
@@ -267,6 +299,108 @@ def _format_metric(value: float | None) -> str:
     if value is None:
         return "Undefined (zero denominator)"
     return f"{value:.1%}"
+
+
+def _render_performance(metrics: AIPerformanceMetrics | None) -> str:
+    if metrics is None:
+        return "Unavailable (historical report contains no performance telemetry)."
+    lines = [
+        f"- Providers: {_format_identities(metrics.provider_identities)}",
+        f"- Models: {_format_identities(metrics.model_identities)}",
+        f"- Measurement sources: {_format_identities(metrics.measurement_sources)}",
+        "| Timing boundary | Samples | Mean (ms) | P50 (ms) | P95 (ms) | Max (ms) |",
+        "| --- | ---: | ---: | ---: | ---: | ---: |",
+        _duration_row("Provider request", metrics.provider_request),
+        _duration_row("Total AI execution", metrics.total_execution),
+        _duration_row("Queue waiting", metrics.queue_waiting),
+    ]
+    return "\n".join(lines)
+
+
+def _duration_row(label: str, metrics: AIDurationMetrics) -> str:
+    return (
+        f"| {label} | {metrics.sample_count} | "
+        f"{_format_number(metrics.mean_duration_ms)} | "
+        f"{_format_number(metrics.p50_duration_ms)} | "
+        f"{_format_number(metrics.p95_duration_ms)} | "
+        f"{_format_number(metrics.maximum_duration_ms)} |"
+    )
+
+
+def _render_token_usage(metrics: AITokenUsageMetrics | None) -> str:
+    if metrics is None:
+        return "Unavailable (historical report contains no token telemetry)."
+    return "\n".join(
+        [
+            f"- Measured PR samples: {metrics.sample_count}",
+            f"- Total input tokens: {_format_integer(metrics.total_input_tokens)}",
+            f"- Total output tokens: {_format_integer(metrics.total_output_tokens)}",
+            f"- Total tokens: {_format_integer(metrics.total_tokens)}",
+            f"- Average input tokens per measured PR: "
+            f"{_format_number(metrics.average_input_tokens_per_pr)}",
+            f"- Average output tokens per measured PR: "
+            f"{_format_number(metrics.average_output_tokens_per_pr)}",
+            f"- Average total tokens per measured PR: "
+            f"{_format_number(metrics.average_tokens_per_pr)}",
+        ]
+    )
+
+
+def _render_cost(metrics: AICostMetrics | None) -> str:
+    if metrics is None:
+        return "Unavailable (historical report contains no cost telemetry)."
+    lines = [
+        f"- Pricing version: {_markdown(metrics.pricing_version or 'Unavailable')}",
+        f"- Currency: {_markdown(metrics.currency or 'Unavailable')}",
+        f"- Priced PR samples: {metrics.sample_count}",
+    ]
+    if metrics.unavailable_reason is not None:
+        lines.append(f"- Estimated cost: Unavailable ({metrics.unavailable_reason})")
+    else:
+        input_cost = _format_cost(metrics.estimated_input_cost, metrics.currency)
+        cached_cost = _format_cost(
+            metrics.estimated_cached_input_cost,
+            metrics.currency,
+        )
+        output_cost = _format_cost(metrics.estimated_output_cost, metrics.currency)
+        total_cost = _format_cost(metrics.estimated_total_cost, metrics.currency)
+        average_cost = _format_cost(
+            metrics.average_cost_per_reviewed_pr,
+            metrics.currency,
+        )
+        finding_cost = _format_cost(
+            metrics.estimated_cost_per_verified_finding,
+            metrics.currency,
+        )
+        lines.extend(
+            [
+                f"- Estimated non-cached input cost: {input_cost}",
+                f"- Estimated cached input cost: {cached_cost}",
+                f"- Estimated output cost: {output_cost}",
+                f"- Estimated total cost: {total_cost}",
+                f"- Average cost per reviewed PR: {average_cost}",
+                f"- Cost per verified finding: {finding_cost}",
+            ]
+        )
+    return "\n".join(lines)
+
+
+def _format_identities(values: tuple[str, ...]) -> str:
+    return _markdown(", ".join(values) if values else "Unavailable")
+
+
+def _format_number(value: float | None) -> str:
+    return f"{value:.2f}" if value is not None else "Unavailable"
+
+
+def _format_integer(value: int | None) -> str:
+    return f"{value:,}" if value is not None else "Unavailable"
+
+
+def _format_cost(value: Decimal | None, currency: str | None) -> str:
+    if not isinstance(value, Decimal) or currency is None:
+        return "Unavailable"
+    return f"{currency} {value:.8f}"
 
 
 def _markdown(value: str) -> str:

@@ -1,10 +1,16 @@
 import json
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+from codeguard.ai.telemetry import (
+    AIExecutionTelemetry,
+    AIPricingConfiguration,
+    AIProviderUsage,
+)
 from codeguard.evaluation.contracts import (
     EvaluationDataset,
     EvaluationResult,
@@ -16,6 +22,7 @@ from codeguard.evaluation.contracts import (
     TestScenarioMatch as ScenarioMatch,
 )
 from codeguard.evaluation.reports import (
+    EvaluationReport,
     build_evaluation_report,
     render_json_report,
     render_markdown_report,
@@ -197,6 +204,8 @@ def test_json_report_serializes_the_same_metrics_model(
     assert payload["metrics"] == report.metrics.model_dump(mode="json")
     assert payload["metrics"]["test_recommendation_metrics"]["micro_averaged"]
     assert payload["metrics"]["test_recommendation_metrics"]["macro_averaged"]
+    assert payload["performance_metrics"]["provider_request"]["sample_count"] == 0
+    assert payload["cost_metrics"]["unavailable_reason"] == "pricing_not_configured"
 
 
 def test_markdown_report_contains_metadata_metrics_cases_and_limitations() -> None:
@@ -208,10 +217,82 @@ def test_markdown_report_contains_metadata_metrics_cases_and_limitations() -> No
     assert "## Executive summary" in markdown
     assert "## Finding quality metrics" in markdown
     assert "## Test recommendation quality" in markdown
+    assert "## AI performance" in markdown
+    assert "## AI token usage" in markdown
+    assert "## AI cost estimate" in markdown
     assert "## Per-case results" in markdown
     assert "## Dataset limitations" in markdown
     assert report.dataset_scope_statement in markdown
     assert report.case_limitations[0].case_id in markdown
+
+
+def test_reports_include_measured_telemetry_and_pricing() -> None:
+    run = _synthetic_run()
+    results = tuple(
+        result.model_copy(
+            update={
+                "ai_telemetry": AIExecutionTelemetry(
+                    provider_identity="provider-x",
+                    model_identity="model-exact",
+                    provider_usage=AIProviderUsage(
+                        input_tokens=100,
+                        output_tokens=20,
+                        total_tokens=120,
+                    ),
+                    provider_request_duration_ms=50,
+                    total_ai_execution_duration_ms=65,
+                    measurement_source="provider",
+                )
+            }
+        )
+        for result in run.results
+    )
+    run = run.model_copy(
+        update={
+            "results": results,
+            "pricing_configuration": AIPricingConfiguration(
+                provider_identity="provider-x",
+                model_identity="model-exact",
+                input_price_per_million_tokens=Decimal("1"),
+                output_price_per_million_tokens=Decimal("2"),
+                currency="USD",
+                pricing_version="test-price-v1",
+                effective_date=date(2026, 1, 1),
+                pricing_source="synthetic test fixture",
+            ),
+        }
+    )
+
+    report = build_evaluation_report(run)
+    json_payload = json.loads(render_json_report(report))
+    markdown = render_markdown_report(report)
+
+    assert json_payload["performance_metrics"]["provider_identities"] == ["provider-x"]
+    assert json_payload["performance_metrics"]["provider_request"]["sample_count"] == (
+        len(run.results)
+    )
+    assert json_payload["token_usage_metrics"]["total_tokens"] == 120 * len(run.results)
+    assert json_payload["cost_metrics"]["pricing_version"] == "test-price-v1"
+    assert json_payload["cost_metrics"]["estimated_total_cost"] is not None
+    assert "provider-x" in markdown
+    assert "test-price-v1" in markdown
+    assert "USD" in markdown
+
+
+def test_historical_report_without_telemetry_remains_readable() -> None:
+    report_payload = json.loads(
+        render_json_report(build_evaluation_report(_synthetic_run()))
+    )
+    report_payload.pop("performance_metrics")
+    report_payload.pop("token_usage_metrics")
+    report_payload.pop("cost_metrics")
+
+    historical_report = EvaluationReport.model_validate_json(json.dumps(report_payload))
+
+    assert historical_report.performance_metrics is None
+    assert "historical report contains no performance telemetry" in (
+        render_markdown_report(historical_report)
+    )
 
 
 def test_cli_writes_json_output_without_modifying_input(

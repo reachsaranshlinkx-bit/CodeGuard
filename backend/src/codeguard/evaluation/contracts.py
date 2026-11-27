@@ -12,6 +12,7 @@ from codeguard.ai.evidence_matching import (
     EvidenceMatcher,
     EvidenceMatchStatus,
 )
+from codeguard.ai.telemetry import AIExecutionTelemetry, AIPricingConfiguration
 from codeguard.context.file_discovery import DiscoveredPythonFile
 from codeguard.context.source_snapshot import (
     RepositorySourceFile,
@@ -254,6 +255,7 @@ class EvaluationResult(_EvaluationModel):
         max_length=50,
     )
     test_scenario_matches: tuple[TestScenarioMatch, ...] = ()
+    ai_telemetry: AIExecutionTelemetry | None = None
 
     @model_validator(mode="after")
     def validate_unique_finding_matches(self) -> EvaluationResult:
@@ -297,6 +299,7 @@ class EvaluationRun(_EvaluationModel):
     system_version: NonBlankText = Field(max_length=100)
     is_complete: bool = True
     results: tuple[EvaluationResult, ...]
+    pricing_configuration: AIPricingConfiguration | None = None
 
     @model_validator(mode="after")
     def validate_result_references(self) -> EvaluationRun:

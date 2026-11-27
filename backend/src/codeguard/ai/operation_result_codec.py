@@ -16,9 +16,11 @@ from codeguard.ai.evidence_matching import (
     EvidenceMatchStatus,
 )
 from codeguard.ai.evidence_validation import EvidenceLocationReason
+from codeguard.ai.telemetry import AIExecutionTelemetry
 
 _RESULT_KIND = "codeguard.ai-review-execution-result"
-_SERIALIZATION_VERSION = 1
+_SERIALIZATION_VERSION = 2
+_SUPPORTED_SERIALIZATION_VERSIONS = frozenset({1, 2})
 _RESULT_SCHEMA_VERSION = 1
 
 
@@ -57,6 +59,7 @@ class _SerializedPayload(BaseModel):
 
     provider_result: dict[str, object]
     assessments: list[_SerializedAssessment]
+    telemetry: AIExecutionTelemetry | None = None
 
 
 class _SerializedEnvelope(BaseModel):
@@ -137,6 +140,11 @@ def encode(result: AIReviewExecutionResult) -> EncodedAIReviewResult:
         raise AIReviewResultCodecError("AI review provider result is invalid.")
     if not isinstance(result.assessments, tuple):
         raise AIReviewResultCodecError("AI review assessments are invalid.")
+    if result.telemetry is not None and not isinstance(
+        result.telemetry,
+        AIExecutionTelemetry,
+    ):
+        raise AIReviewResultCodecError("AI review execution telemetry is invalid.")
 
     provider_result = _validate_provider_result(result.provider_result)
     findings = provider_result.findings
@@ -177,6 +185,11 @@ def encode(result: AIReviewExecutionResult) -> EncodedAIReviewResult:
                 "payload": {
                     "provider_result": provider_result.model_dump(mode="json"),
                     "assessments": serialized_assessments,
+                    "telemetry": (
+                        result.telemetry.model_dump(mode="json")
+                        if result.telemetry is not None
+                        else None
+                    ),
                 },
             },
             strict=True,
@@ -247,7 +260,7 @@ def _check_database_versions(
     ):
         raise AIReviewResultCodecError("Stored AI review result versions do not match.")
 
-    if serialization_version != _SERIALIZATION_VERSION:
+    if serialization_version not in _SUPPORTED_SERIALIZATION_VERSIONS:
         raise AIReviewResultCodecError(
             "Stored AI review serialization version is unsupported."
         )
@@ -354,6 +367,18 @@ def decode(
         serialization_version,
         document,
     )
+    payload = document.get("payload")
+    if not isinstance(payload, dict):
+        raise AIReviewResultCodecError("Stored AI review result payload is invalid.")
+    expected_payload_fields = (
+        {"provider_result", "assessments"}
+        if serialization_version == 1
+        else {"provider_result", "assessments", "telemetry"}
+    )
+    if set(payload) != expected_payload_fields:
+        raise AIReviewResultCodecError(
+            "Stored AI review result payload is incomplete or invalid."
+        )
 
     try:
         envelope = _SerializedEnvelope.model_validate_json(
@@ -373,4 +398,5 @@ def decode(
     return AIReviewExecutionResult(
         provider_result=provider_result,
         assessments=assessments,
+        telemetry=envelope.payload.telemetry,
     )

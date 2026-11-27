@@ -22,6 +22,7 @@ from codeguard.ai.operation_result_codec import (
     decode,
     encode,
 )
+from codeguard.ai.telemetry import AIExecutionTelemetry, AIProviderUsage
 
 
 def make_candidate(index: int, *, evidence: str | None = None) -> AIFindingCandidate:
@@ -84,10 +85,11 @@ def make_execution_result(
 
 
 def decode_document(document: object) -> AIReviewExecutionResult:
+    assert isinstance(document, dict)
     return decode(
         json.dumps(document, ensure_ascii=False),
-        result_schema_version=1,
-        serialization_version=1,
+        result_schema_version=document["result_schema_version"],
+        serialization_version=document["serialization_version"],
     )
 
 
@@ -105,7 +107,7 @@ def test_empty_execution_result_round_trips() -> None:
 
     encoded = encode(result)
 
-    assert (encoded.result_schema_version, encoded.serialization_version) == (1, 1)
+    assert (encoded.result_schema_version, encoded.serialization_version) == (1, 2)
     assert (
         decode(
             encoded.result_json,
@@ -195,7 +197,7 @@ def test_all_evidence_statuses_reasons_and_location_reasons_round_trip() -> None
     decoded = decode(
         encode(result).result_json,
         result_schema_version=1,
-        serialization_version=1,
+        serialization_version=2,
     )
 
     assert decoded == result
@@ -394,33 +396,33 @@ def test_duplicate_json_object_keys_are_rejected() -> None:
 
 def test_unsupported_serialization_version_is_rejected() -> None:
     document = document_from(encode(make_execution_result()))
-    document["serialization_version"] = 2
+    document["serialization_version"] = 3
     document["result_schema_version"] = 1
 
     with pytest.raises(AIReviewResultCodecError):
         decode(
             json.dumps(document),
             result_schema_version=1,
-            serialization_version=2,
+            serialization_version=3,
         )
 
 
 def test_unsupported_result_schema_version_is_rejected() -> None:
     document = document_from(encode(make_execution_result()))
-    document["serialization_version"] = 1
+    document["serialization_version"] = 2
     document["result_schema_version"] = 2
 
     with pytest.raises(AIReviewResultCodecError):
         decode(
             json.dumps(document),
             result_schema_version=2,
-            serialization_version=1,
+            serialization_version=2,
         )
 
 
 @pytest.mark.parametrize(
     ("database_schema_version", "database_serialization_version"),
-    [(2, 1), (1, 2)],
+    [(2, 2), (1, 1)],
 )
 def test_envelope_database_version_mismatch_is_rejected(
     database_schema_version: int,
@@ -520,7 +522,53 @@ def test_serialized_result_excludes_raw_context_and_snapshot_content() -> None:
     provider_result = payload["provider_result"]
     assert isinstance(provider_result, dict)
 
-    assert set(payload) == {"provider_result", "assessments"}
+    assert set(payload) == {"provider_result", "assessments", "telemetry"}
     assert "context" not in provider_result
     assert "source_snapshot" not in provider_result
     assert "exact source" in result.provider_result.findings[0].evidence
+
+
+def test_legacy_version_one_result_decodes_with_unknown_telemetry() -> None:
+    legacy = document_from(encode(make_execution_result()))
+    legacy["serialization_version"] = 1
+    payload = legacy["payload"]
+    assert isinstance(payload, dict)
+    payload.pop("telemetry")
+
+    decoded = decode(
+        json.dumps(legacy),
+        result_schema_version=1,
+        serialization_version=1,
+    )
+
+    assert decoded.telemetry is None
+
+
+def test_version_two_result_round_trips_telemetry() -> None:
+    result = make_execution_result()
+    result = replace(
+        result,
+        telemetry=AIExecutionTelemetry(
+            provider_identity="provider-x",
+            model_identity="model-y",
+            provider_usage=AIProviderUsage(
+                input_tokens=10,
+                output_tokens=4,
+                total_tokens=14,
+                cached_input_tokens=2,
+            ),
+            provider_request_duration_ms=12.5,
+            total_ai_execution_duration_ms=15.25,
+            measurement_source="provider",
+        ),
+    )
+
+    encoded = encode(result)
+    decoded = decode(
+        encoded.result_json,
+        encoded.result_schema_version,
+        encoded.serialization_version,
+    )
+
+    assert encoded.serialization_version == 2
+    assert decoded == result

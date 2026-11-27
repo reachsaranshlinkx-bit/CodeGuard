@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import json
-from typing import Any
+from time import perf_counter_ns
+from typing import Any, TypeGuard
 
 import httpx
 from pydantic import SecretStr, ValidationError
@@ -19,11 +20,18 @@ from codeguard.ai.exceptions import (
 )
 from codeguard.ai.execution_metadata import AIExecutionMetadata
 from codeguard.ai.http_client import AIProviderHTTPClient
+from codeguard.ai.provider import AIProviderExecutionResult
+from codeguard.ai.telemetry import AIProviderUsage
 
 OPENAI_PROVIDER_IDENTITY = "openai"
 OPENAI_PROMPT_CONTRACT_VERSION = "openai-responses-review-v1"
 OPENAI_RESPONSES_BASE_URL = "https://api.openai.com/v1"
 OPENAI_RESPONSES_PATH = "responses"
+
+
+def _is_token_count(value: object) -> TypeGuard[int]:
+    return type(value) is int and value >= 0
+
 
 _SYSTEM_INSTRUCTIONS = """
 You are CodeGuard's security review candidate generator. Analyze only the
@@ -114,6 +122,14 @@ class OpenAIReviewProvider:
     async def review(self, review_input: AIReviewInput) -> AIReviewResult:
         """Submit untrusted review context and validate the structured response."""
 
+        return (await self.review_with_telemetry(review_input)).review_result
+
+    async def review_with_telemetry(
+        self,
+        review_input: AIReviewInput,
+    ) -> AIProviderExecutionResult:
+        """Return response metadata scoped to this request, without shared state."""
+
         if not isinstance(review_input, AIReviewInput):
             raise TypeError("review_input must be an AIReviewInput instance.")
 
@@ -153,10 +169,9 @@ class OpenAIReviewProvider:
             },
         }
 
-        response = await self._client.post_json(
-            OPENAI_RESPONSES_PATH,
-            request_payload,
-        )
+        request_started_ns = perf_counter_ns()
+        response = await self._client.post_json(OPENAI_RESPONSES_PATH, request_payload)
+        request_duration_ms = (perf_counter_ns() - request_started_ns) / 1_000_000
         output_text = self._extract_output_text(response)
 
         try:
@@ -177,11 +192,52 @@ class OpenAIReviewProvider:
             )
 
         try:
-            return AIReviewResult.model_validate(result_data)
+            result = AIReviewResult.model_validate(result_data)
         except ValidationError:
             raise AIProviderResponseError(
                 "OpenAI response does not conform to the CodeGuard review contract."
             ) from None
+        return AIProviderExecutionResult(
+            review_result=result,
+            usage=self._extract_usage(response.get("usage")),
+            request_duration_ms=request_duration_ms,
+            provider_identity=OPENAI_PROVIDER_IDENTITY,
+            model_identity=self._model_identity,
+        )
+
+    @staticmethod
+    def _extract_usage(value: object) -> AIProviderUsage | None:
+        """Read usage counts only; malformed optional metadata remains unavailable."""
+
+        if not isinstance(value, dict):
+            return None
+        input_tokens = value.get("input_tokens")
+        output_tokens = value.get("output_tokens")
+        total_tokens = value.get("total_tokens")
+        details = value.get("input_tokens_details")
+        cached_tokens: object = None
+        if details is not None:
+            if not isinstance(details, dict):
+                return None
+            cached_tokens = details.get("cached_tokens")
+
+        if not (
+            _is_token_count(input_tokens)
+            and _is_token_count(output_tokens)
+            and _is_token_count(total_tokens)
+        ):
+            return None
+        if cached_tokens is not None and not _is_token_count(cached_tokens):
+            return None
+        try:
+            return AIProviderUsage(
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                total_tokens=total_tokens,
+                cached_input_tokens=cached_tokens,
+            )
+        except ValidationError:
+            return None
 
     @staticmethod
     def _extract_output_text(response: dict[str, Any]) -> str:

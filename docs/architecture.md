@@ -324,6 +324,26 @@ Responsibilities:
 - LLM integration.
 - Prompt management.
 - Structured output handling.
+- Provider-neutral execution timing, token usage, and durable telemetry.
+
+AI telemetry is kept separate from review findings. Provider request latency
+covers the provider HTTP request/response only; total AI execution latency covers
+provider review and independent evidence assessment. Queue wait is unavailable
+unless both enqueue and worker-start boundaries can be measured reliably.
+Durations use a monotonic in-process clock. Evaluation latency percentiles use
+the nearest-rank method (`ceil(p * n)`, one-based), excluding unavailable samples
+and reporting a sample count for each timing boundary. Synthetic and runtime
+measurements retain source labels rather than being presented as provider data.
+
+Provider usage is recorded only when the response includes valid token counts.
+Missing or malformed optional usage does not invalidate an otherwise valid
+review. Durable AI results use serialization version 2 for telemetry and
+continue decoding version 1 results with telemetry unavailable. Evaluation cost
+estimates require an explicit versioned pricing configuration matching the exact
+provider and model; no default model prices are assumed. Costs use decimal
+arithmetic and are rounded to eight decimal places using half-up rounding.
+Cost per verified finding uses evaluation true-positive finding matches as its
+denominator and is unavailable when there are no verified matches.
 
 ### db/
 
