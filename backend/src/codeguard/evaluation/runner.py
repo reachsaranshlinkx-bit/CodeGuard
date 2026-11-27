@@ -16,12 +16,24 @@ from pathlib import Path
 from pydantic import ValidationError
 
 from codeguard.evaluation.contracts import EvaluationRun
+from codeguard.evaluation.regression import (
+    IncompatibleEvaluationReportsError,
+    RegressionPolicy,
+    UndefinedMetricError,
+    compare_evaluation_reports,
+    render_regression_json,
+)
 from codeguard.evaluation.reports import (
     EvaluationReport,
     build_evaluation_report,
     render_json_report,
     render_markdown_report,
 )
+
+_INVALID_INPUT_EXIT_CODE = 2
+_INCOMPATIBLE_REPORTS_EXIT_CODE = 3
+_INCONCLUSIVE_EXIT_CODE = 4
+_REPORT_WRITE_EXIT_CODE = 5
 
 
 class InvalidEvaluationJSONError(ValueError):
@@ -49,12 +61,34 @@ def load_evaluation_run(input_path: Path) -> EvaluationRun:
     try:
         run = EvaluationRun.model_validate_json(input_text)
     except ValidationError as error:
-        if any(detail["type"] == "json_invalid" for detail in error.errors()):
-            raise InvalidEvaluationJSONError from None
+        _raise_if_invalid_json(error)
         raise
     if not run.is_complete:
         raise IncompleteEvaluationRunError
     return run
+
+
+def _raise_if_invalid_json(error: ValidationError) -> None:
+    if any(detail["type"] == "json_invalid" for detail in error.errors()):
+        raise InvalidEvaluationJSONError from None
+
+
+def _load_evaluation_report(input_path: Path) -> EvaluationReport:
+    input_text = input_path.read_text(encoding="utf-8")
+    try:
+        return EvaluationReport.model_validate_json(input_text)
+    except ValidationError as error:
+        _raise_if_invalid_json(error)
+        raise
+
+
+def _load_regression_policy(input_path: Path) -> RegressionPolicy:
+    input_text = input_path.read_text(encoding="utf-8")
+    try:
+        return RegressionPolicy.model_validate_json(input_text)
+    except ValidationError as error:
+        _raise_if_invalid_json(error)
+        raise
 
 
 def evaluate_run_file(input_path: Path) -> EvaluationReport:
@@ -106,6 +140,10 @@ def _argument_parser() -> argparse.ArgumentParser:
             "Generate a deterministic report from a validated EvaluationRun JSON "
             "artifact."
         ),
+        epilog=(
+            "Compare reports with: codeguard-evaluation compare --baseline "
+            "baseline.json --candidate candidate.json --policy policy.json"
+        ),
     )
     parser.add_argument(
         "--input",
@@ -127,17 +165,15 @@ def _argument_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _report_error(message: str) -> int:
+def _report_error(message: str, exit_code: int = 1) -> int:
     sys.stderr.write(f"codeguard-evaluation: {message}\n")
-    return 1
+    return exit_code
 
 
-def main(argv: Sequence[str] | None = None) -> int:
-    """Run the CLI and return a non-zero status for input or output failures."""
-
-    arguments = _argument_parser().parse_args(argv)
+def _run_report_cli(arguments: Sequence[str]) -> int:
+    parsed_arguments = _argument_parser().parse_args(arguments)
     try:
-        report = evaluate_run_file(arguments.input)
+        report = evaluate_run_file(parsed_arguments.input)
     except FileNotFoundError:
         return _report_error("Evaluation input file was not found.")
     except InvalidEvaluationJSONError:
@@ -157,10 +193,10 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     rendered_report = (
         render_json_report(report)
-        if arguments.format == "json"
+        if parsed_arguments.format == "json"
         else render_markdown_report(report)
     )
-    if arguments.output is None:
+    if parsed_arguments.output is None:
         try:
             sys.stdout.write(rendered_report)
             sys.stdout.flush()
@@ -170,8 +206,8 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     try:
         write_report_atomically(
-            arguments.output,
-            arguments.input,
+            parsed_arguments.output,
+            parsed_arguments.input,
             rendered_report,
         )
     except OutputInputCollisionError:
@@ -181,6 +217,113 @@ def main(argv: Sequence[str] | None = None) -> int:
             "Could not write report; check that the destination is writable."
         )
     return 0
+
+
+def _comparison_argument_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="codeguard-evaluation compare",
+        description="Compare candidate metrics with an approved baseline report.",
+    )
+    parser.add_argument("--baseline", type=Path, required=True)
+    parser.add_argument("--candidate", type=Path, required=True)
+    parser.add_argument("--policy", type=Path, required=True)
+    parser.add_argument(
+        "--output",
+        type=Path,
+        help="Regression JSON destination; writes to stdout when omitted.",
+    )
+    return parser
+
+
+def _run_comparison_cli(arguments: Sequence[str]) -> int:
+    parsed_arguments = _comparison_argument_parser().parse_args(arguments)
+    try:
+        baseline = _load_evaluation_report(parsed_arguments.baseline)
+        candidate = _load_evaluation_report(parsed_arguments.candidate)
+        policy = _load_regression_policy(parsed_arguments.policy)
+        result = compare_evaluation_reports(baseline, candidate, policy)
+    except FileNotFoundError:
+        return _report_error(
+            "Baseline, candidate, or policy input file was not found.",
+            _INVALID_INPUT_EXIT_CODE,
+        )
+    except InvalidEvaluationJSONError:
+        return _report_error(
+            "Baseline, candidate, or policy input is not valid JSON.",
+            _INVALID_INPUT_EXIT_CODE,
+        )
+    except UnicodeDecodeError:
+        return _report_error(
+            "Baseline, candidate, and policy files must be UTF-8 encoded.",
+            _INVALID_INPUT_EXIT_CODE,
+        )
+    except IncompatibleEvaluationReportsError as error:
+        return _report_error(str(error), _INCOMPATIBLE_REPORTS_EXIT_CODE)
+    except UndefinedMetricError as error:
+        return _report_error(str(error), _INCONCLUSIVE_EXIT_CODE)
+    except ValidationError:
+        return _report_error(
+            "Baseline, candidate, or policy does not satisfy its contract.",
+            _INVALID_INPUT_EXIT_CODE,
+        )
+    except OSError:
+        return _report_error(
+            "Could not read the baseline, candidate, or policy file.",
+            _INVALID_INPUT_EXIT_CODE,
+        )
+
+    rendered_report = render_regression_json(result)
+    if parsed_arguments.output is None:
+        try:
+            sys.stdout.write(rendered_report)
+            sys.stdout.flush()
+        except OSError:
+            return _report_error(
+                "Could not write the comparison to standard output.",
+                _REPORT_WRITE_EXIT_CODE,
+            )
+    else:
+        try:
+            output_path = parsed_arguments.output
+            source_paths = (
+                parsed_arguments.baseline,
+                parsed_arguments.candidate,
+                parsed_arguments.policy,
+            )
+            if any(
+                output_path.resolve() == source.resolve() for source in source_paths
+            ):
+                raise OutputInputCollisionError
+            write_report_atomically(
+                output_path,
+                parsed_arguments.baseline,
+                rendered_report,
+            )
+        except OutputInputCollisionError:
+            return _report_error(
+                "Output destination must not replace a comparison input.",
+                _REPORT_WRITE_EXIT_CODE,
+            )
+        except OSError:
+            return _report_error(
+                "Could not write comparison report; check the destination.",
+                _REPORT_WRITE_EXIT_CODE,
+            )
+
+    if result.overall_outcome == "fail":
+        return 1
+    if result.overall_outcome == "inconclusive":
+        return _INCONCLUSIVE_EXIT_CODE
+    return 0
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    """Run report generation or the opt-in ``compare`` subcommand."""
+
+    arguments = sys.argv[1:] if argv is None else argv
+    if arguments and arguments[0] == "compare":
+        return _run_comparison_cli(arguments[1:])
+    return _run_report_cli(arguments)
 
 
 if __name__ == "__main__":
