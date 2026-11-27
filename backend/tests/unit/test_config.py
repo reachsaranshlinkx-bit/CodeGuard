@@ -29,13 +29,72 @@ def test_ai_provider_is_loaded_from_environment(
     assert settings.ai_provider == provider
 
 
+def test_openai_provider_is_loaded_with_required_configuration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CODEGUARD_ENVIRONMENT", "testing")
+    monkeypatch.setenv("CODEGUARD_AI_PROVIDER", "openai")
+    monkeypatch.setenv("CODEGUARD_OPENAI_API_KEY", "test-openai-secret")
+    monkeypatch.setenv("CODEGUARD_OPENAI_MODEL", "gpt-test-model")
+
+    settings = Settings(_env_file=None)
+
+    assert settings.ai_provider == "openai"
+    assert settings.openai_api_key is not None
+    assert settings.openai_api_key.get_secret_value() == "test-openai-secret"
+    assert str(settings.openai_api_key) == "**********"
+    assert "test-openai-secret" not in repr(settings)
+    assert settings.openai_model == "gpt-test-model"
+
+
+def test_openai_credentials_do_not_enable_provider_by_themselves() -> None:
+    settings = Settings(
+        _env_file=None,
+        environment="testing",
+        openai_api_key="test-openai-secret",
+        openai_model="gpt-test-model",
+    )
+
+    assert settings.ai_provider == "disabled"
+
+
 def test_ai_provider_rejects_unsupported_environment_value(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("CODEGUARD_AI_PROVIDER", "openai")
+    monkeypatch.setenv("CODEGUARD_AI_PROVIDER", "unsupported")
 
     with pytest.raises(ValidationError):
         Settings(_env_file=None)
+
+
+@pytest.mark.parametrize(
+    ("openai_api_key", "openai_model", "expected_error"),
+    [
+        (None, "gpt-test-model", "CODEGUARD_OPENAI_API_KEY"),
+        ("   ", "gpt-test-model", "CODEGUARD_OPENAI_API_KEY"),
+        ("invalid\r\nheader", "gpt-test-model", "CODEGUARD_OPENAI_API_KEY"),
+        ("test-openai-secret", None, "CODEGUARD_OPENAI_MODEL"),
+        ("test-openai-secret", "   ", "CODEGUARD_OPENAI_MODEL"),
+        ("test-openai-secret", "gpt-\x00model", "CODEGUARD_OPENAI_MODEL"),
+    ],
+)
+def test_openai_provider_rejects_invalid_configuration_without_secret_leaks(
+    openai_api_key: str | None,
+    openai_model: str | None,
+    expected_error: str,
+) -> None:
+    with pytest.raises(ValidationError) as exc_info:
+        Settings(
+            _env_file=None,
+            environment="testing",
+            ai_provider="openai",
+            openai_api_key=openai_api_key,
+            openai_model=openai_model,
+        )
+
+    error_text = str(exc_info.value)
+    assert expected_error in error_text
+    assert "test-openai-secret" not in error_text
 
 
 @pytest.mark.parametrize("environment", ["development", "testing"])

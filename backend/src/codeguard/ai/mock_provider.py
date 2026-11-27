@@ -1,4 +1,11 @@
-from codeguard.ai.contracts import AIReviewInput, AIReviewResult
+from codeguard.ai.context_builder import CONTEXT_CONTRACT_VERSION
+from codeguard.ai.contracts import (
+    REVIEW_CONTRACT_VERSION,
+    AIReviewInput,
+    AIReviewResult,
+)
+from codeguard.ai.evidence_matching import EVIDENCE_CONTRACT_VERSION
+from codeguard.ai.execution_metadata import AIExecutionMetadata
 
 MOCK_PROVIDER_IDENTITY = "codeguard.mock"
 # Change the profile identity whenever the default mock result semantics change.
@@ -52,6 +59,24 @@ class MockAIReviewProvider:
         """Return the stable result profile, if this mock is durable-reuse ready."""
 
         return self._profile_identity
+
+    @property
+    def execution_metadata(self) -> AIExecutionMetadata:
+        """Return the durable identity associated with this mock profile."""
+
+        if self._profile_identity is None:
+            raise ValueError(
+                "Mock provider requires a stable profile identity for durable reuse."
+            )
+
+        return AIExecutionMetadata(
+            provider_identity=MOCK_PROVIDER_IDENTITY,
+            model_identity=self._profile_identity,
+            prompt_contract_version=MOCK_PROMPT_CONTRACT_VERSION,
+            context_contract_version=CONTEXT_CONTRACT_VERSION,
+            evidence_contract_version=EVIDENCE_CONTRACT_VERSION,
+            review_contract_version=REVIEW_CONTRACT_VERSION,
+        )
 
     @property
     def reviewed_inputs(self) -> tuple[AIReviewInput, ...]:

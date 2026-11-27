@@ -6,7 +6,10 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from codeguard.ai.execution_coordinator import AIExecutionCoordinator
-from codeguard.ai.factory import create_ai_review_provider_selection
+from codeguard.ai.factory import (
+    AIReviewProviderSelection,
+    create_ai_review_provider_selection,
+)
 from codeguard.ai.operation_repository import AIOperationRepository
 from codeguard.api.v1.health import router as health_router
 from codeguard.api.v1.reviews import router as reviews_router
@@ -79,6 +82,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         github_client = GitHubClient(token=token)
         worker_task: asyncio.Task[None] | None = None
         stop_event = asyncio.Event()
+        provider_selection: AIReviewProviderSelection | None = None
 
         try:
             provider_selection = create_ai_review_provider_selection(app_settings)
@@ -136,7 +140,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 logger.info("webhook_worker_stopped")
 
         finally:
-            await github_client.aclose()
+            try:
+                if provider_selection is not None:
+                    await provider_selection.aclose()
+            finally:
+                await github_client.aclose()
 
     app = FastAPI(
         title=app_settings.app_name,

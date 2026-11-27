@@ -1,17 +1,17 @@
 from dataclasses import dataclass
 
-from codeguard.ai.context_builder import CONTEXT_CONTRACT_VERSION
-from codeguard.ai.contracts import REVIEW_CONTRACT_VERSION, AIReviewResult
-from codeguard.ai.evidence_matching import EVIDENCE_CONTRACT_VERSION
+from codeguard.ai.contracts import AIReviewResult
 from codeguard.ai.exceptions import AIProviderConfigurationError
 from codeguard.ai.execution_metadata import AIExecutionMetadata
 from codeguard.ai.mock_provider import (
     DEFAULT_MOCK_PROFILE_IDENTITY,
-    MOCK_PROMPT_CONTRACT_VERSION,
-    MOCK_PROVIDER_IDENTITY,
     MockAIReviewProvider,
 )
-from codeguard.ai.provider import AIReviewProvider
+from codeguard.ai.provider import (
+    AIReviewProvider,
+    AIReviewProviderExecutionIdentity,
+    ClosableAIReviewProvider,
+)
 from codeguard.core.config import Settings
 
 
@@ -19,39 +19,34 @@ from codeguard.core.config import Settings
 class AIReviewProviderSelection:
     """A provider paired with the metadata for that exact selection."""
 
-    provider: AIReviewProvider
+    provider: AIReviewProviderExecutionIdentity
     metadata: AIExecutionMetadata
 
     def __post_init__(self) -> None:
         """Reject provider/metadata combinations that do not describe each other."""
 
-        if not isinstance(self.provider, MockAIReviewProvider):
+        try:
+            provider_metadata = self.provider.execution_metadata
+        except (AttributeError, TypeError, ValueError):
             raise AIProviderConfigurationError(
-                "Unsupported provider selection for durable execution metadata."
+                "Provider selection has invalid durable execution metadata."
+            ) from None
+
+        if not isinstance(provider_metadata, AIExecutionMetadata):
+            raise AIProviderConfigurationError(
+                "Provider selection must expose valid durable execution metadata."
             )
 
-        profile_identity = self.provider.profile_identity
-        if profile_identity is None:
-            raise AIProviderConfigurationError(
-                "Mock provider requires a stable profile identity for durable reuse."
-            )
-
-        expected_metadata = _mock_execution_metadata(profile_identity)
-        if self.metadata != expected_metadata:
+        if self.metadata != provider_metadata:
             raise AIProviderConfigurationError(
                 "Provider selection metadata does not match its provider."
             )
 
+    async def aclose(self) -> None:
+        """Close the selected provider when it owns a closable client."""
 
-def _mock_execution_metadata(profile_identity: str) -> AIExecutionMetadata:
-    return AIExecutionMetadata(
-        provider_identity=MOCK_PROVIDER_IDENTITY,
-        model_identity=profile_identity,
-        prompt_contract_version=MOCK_PROMPT_CONTRACT_VERSION,
-        context_contract_version=CONTEXT_CONTRACT_VERSION,
-        evidence_contract_version=EVIDENCE_CONTRACT_VERSION,
-        review_contract_version=REVIEW_CONTRACT_VERSION,
-    )
+        if isinstance(self.provider, ClosableAIReviewProvider):
+            await self.provider.aclose()
 
 
 def create_ai_review_provider_selection(
@@ -111,10 +106,16 @@ def create_ai_review_provider_selection(
                 "Mock provider requires a stable profile identity for durable reuse."
             )
 
-        metadata = _mock_execution_metadata(provider.profile_identity)
+        metadata = provider.execution_metadata
         return AIReviewProviderSelection(
             provider=provider,
             metadata=metadata,
+        )
+
+    if settings.ai_provider == "openai":
+        raise AIProviderConfigurationError(
+            "OpenAI provider selection is unavailable until its request adapter "
+            "is implemented."
         )
 
     raise AIProviderConfigurationError("Unsupported AI provider selection.")

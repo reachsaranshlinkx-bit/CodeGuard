@@ -31,10 +31,12 @@ class Settings(BaseSettings):
     environment: Environment = "development"
     debug: bool = False
     log_level: LogLevel = "INFO"
-    ai_provider: Literal["disabled", "mock"] = "disabled"
+    ai_provider: Literal["disabled", "mock", "openai"] = "disabled"
 
     github_token: SecretStr | None = None
     api_key: SecretStr | None = None
+    openai_api_key: SecretStr | None = None
+    openai_model: str | None = None
     webhook_database_path: Path = Path("data/webhook_deliveries.sqlite3")
     github_webhook_secret: SecretStr | None = None
     enable_review_publishing: bool = False
@@ -65,6 +67,34 @@ class Settings(BaseSettings):
                 "CODEGUARD_AI_PROVIDER=mock is only permitted in development "
                 "and testing."
             )
+
+        if self.ai_provider == "openai":
+            openai_api_key = (
+                self.openai_api_key.get_secret_value()
+                if self.openai_api_key is not None
+                else None
+            )
+            if (
+                openai_api_key is None
+                or not openai_api_key.strip()
+                or "\r" in openai_api_key
+                or "\n" in openai_api_key
+            ):
+                raise ValueError(
+                    "CODEGUARD_OPENAI_API_KEY must be configured as a "
+                    "non-empty valid secret."
+                )
+
+            if self.openai_model is None or not self.openai_model.strip():
+                raise ValueError(
+                    "CODEGUARD_OPENAI_MODEL must be configured as a non-empty "
+                    "model identity."
+                )
+
+            normalized_model = self.openai_model.strip()
+            if any(not character.isprintable() for character in normalized_model):
+                raise ValueError("CODEGUARD_OPENAI_MODEL contains invalid characters.")
+            object.__setattr__(self, "openai_model", normalized_model)
 
         if self.environment != "production":
             return self
