@@ -8,12 +8,15 @@ from codeguard.evaluation.contracts import (
     EvaluationRun,
     ExpectedFinding,
     FindingMatch,
+    TestScenarioMatch,
     load_evaluation_dataset,
 )
 from codeguard.evaluation.metrics import (
     CaseEvaluationMetrics,
     CoreMetrics,
     EvaluationMetrics,
+    TestRecommendationCaseMetrics,
+    TestRecommendationMetrics,
     calculate_evaluation_metrics,
 )
 
@@ -28,6 +31,9 @@ __all__ = [
     "EvaluationRun",
     "ExpectedFinding",
     "FindingMatch",
+    "TestRecommendationCaseMetrics",
+    "TestRecommendationMetrics",
+    "TestScenarioMatch",
     "calculate_evaluation_metrics",
     "load_evaluation_dataset",
 ]

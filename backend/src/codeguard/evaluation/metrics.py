@@ -12,7 +12,10 @@ Severity, evidence, and line accuracy each equal exact correct matched pairs
 divided by TP, and are ``None`` when TP is zero. The negative-case false
 positive rate is the number of evaluated negative cases with at least one FP
 divided by the number of evaluated negative cases; it is not the classical
-statistical false-positive rate.
+statistical false-positive rate. Test recommendation counts use only explicit
+scenario matches: unmatched predictions are FP and unmatched expected
+scenarios are FN. Recommendation metrics use the same precision, recall, F1,
+micro, and macro formulas, independently of finding metrics.
 """
 
 from __future__ import annotations
@@ -62,6 +65,33 @@ class CaseEvaluationMetrics(_MetricsModel):
     line_accuracy: float | None = Field(ge=0, le=1)
 
 
+class TestRecommendationCaseMetrics(_MetricsModel):
+    """Recommendation classification metrics for one evaluated case."""
+
+    case_id: CaseIdentifier
+    true_positives: int = Field(ge=0, strict=True)
+    false_positives: int = Field(ge=0, strict=True)
+    false_negatives: int = Field(ge=0, strict=True)
+    precision: float | None = Field(ge=0, le=1)
+    recall: float | None = Field(ge=0, le=1)
+    f1: float | None = Field(ge=0, le=1)
+
+
+class TestRecommendationMetrics(_MetricsModel):
+    """Aggregate and per-case metrics for test recommendations only."""
+
+    evaluated_case_count: int = Field(ge=1, strict=True)
+    true_positives: int = Field(ge=0, strict=True)
+    false_positives: int = Field(ge=0, strict=True)
+    false_negatives: int = Field(ge=0, strict=True)
+    precision: float | None = Field(ge=0, le=1)
+    recall: float | None = Field(ge=0, le=1)
+    f1: float | None = Field(ge=0, le=1)
+    micro_averaged: CoreMetrics
+    macro_averaged: CoreMetrics
+    per_case: tuple[TestRecommendationCaseMetrics, ...]
+
+
 class EvaluationMetrics(_MetricsModel):
     """Validated aggregate metrics and dataset-ordered per-case breakdown."""
 
@@ -82,6 +112,7 @@ class EvaluationMetrics(_MetricsModel):
     line_accuracy: float | None = Field(ge=0, le=1)
     negative_case_false_positive_rate: float | None = Field(ge=0, le=1)
     per_case: tuple[CaseEvaluationMetrics, ...]
+    test_recommendation_metrics: TestRecommendationMetrics
 
 
 def calculate_evaluation_metrics(run: EvaluationRun) -> EvaluationMetrics:
@@ -106,6 +137,10 @@ def calculate_evaluation_metrics(run: EvaluationRun) -> EvaluationMetrics:
         precision=_mean_defined(metrics.precision for metrics in per_case),
         recall=_mean_defined(metrics.recall for metrics in per_case),
         f1=_mean_defined(metrics.f1 for metrics in per_case),
+    )
+    test_recommendation_metrics = _calculate_test_recommendation_metrics(
+        run,
+        results_by_case_id,
     )
 
     matched_count = true_positives
@@ -154,6 +189,7 @@ def calculate_evaluation_metrics(run: EvaluationRun) -> EvaluationMetrics:
             negative_case_count,
         ),
         per_case=per_case,
+        test_recommendation_metrics=test_recommendation_metrics,
     )
 
 
@@ -190,6 +226,59 @@ def _calculate_case_metrics(
         severity_accuracy=_ratio(severity_correct, true_positives),
         evidence_accuracy=_ratio(evidence_correct, true_positives),
         line_accuracy=_ratio(line_correct, true_positives),
+    )
+
+
+def _calculate_test_recommendation_metrics(
+    run: EvaluationRun,
+    results_by_case_id: dict[str, EvaluationResult],
+) -> TestRecommendationMetrics:
+    per_case = tuple(
+        _calculate_test_recommendation_case_metrics(
+            case,
+            results_by_case_id[case.case_id],
+        )
+        for case in run.dataset.cases
+    )
+    true_positives = sum(metrics.true_positives for metrics in per_case)
+    false_positives = sum(metrics.false_positives for metrics in per_case)
+    false_negatives = sum(metrics.false_negatives for metrics in per_case)
+    micro = _core_metrics(true_positives, false_positives, false_negatives)
+    macro = CoreMetrics(
+        precision=_mean_defined(metrics.precision for metrics in per_case),
+        recall=_mean_defined(metrics.recall for metrics in per_case),
+        f1=_mean_defined(metrics.f1 for metrics in per_case),
+    )
+    return TestRecommendationMetrics(
+        evaluated_case_count=len(per_case),
+        true_positives=true_positives,
+        false_positives=false_positives,
+        false_negatives=false_negatives,
+        precision=micro.precision,
+        recall=micro.recall,
+        f1=micro.f1,
+        micro_averaged=micro,
+        macro_averaged=macro,
+        per_case=per_case,
+    )
+
+
+def _calculate_test_recommendation_case_metrics(
+    case: EvaluationCase,
+    result: EvaluationResult,
+) -> TestRecommendationCaseMetrics:
+    true_positives = len(result.test_scenario_matches)
+    false_positives = len(result.predicted_test_scenarios) - true_positives
+    false_negatives = len(case.recommended_test_scenarios) - true_positives
+    core = _core_metrics(true_positives, false_positives, false_negatives)
+    return TestRecommendationCaseMetrics(
+        case_id=case.case_id,
+        true_positives=true_positives,
+        false_positives=false_positives,
+        false_negatives=false_negatives,
+        precision=core.precision,
+        recall=core.recall,
+        f1=core.f1,
     )
 
 

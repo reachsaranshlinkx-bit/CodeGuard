@@ -121,10 +121,7 @@ class EvaluationCase(_EvaluationModel):
     head_snapshot: EvaluationSourceSnapshot
     changed_files: tuple[EvaluationChangedFile, ...] = Field(min_length=1)
     expected_findings: tuple[ExpectedFinding, ...] = Field(max_length=50)
-    recommended_test_scenarios: tuple[NonBlankText, ...] = Field(
-        min_length=1,
-        max_length=20,
-    )
+    recommended_test_scenarios: tuple[NonBlankText, ...] = Field(max_length=20)
     analysis_limitations: tuple[NonBlankText, ...] = Field(min_length=1, max_length=20)
 
     @model_validator(mode="after")
@@ -233,16 +230,30 @@ class FindingMatch(_EvaluationModel):
     ground_truth_finding_id: FindingIdentifier
 
 
+class TestScenarioMatch(_EvaluationModel):
+    """Human-adjudicated association between predicted and expected scenarios."""
+
+    predicted_scenario_index: int = Field(ge=0, strict=True)
+    expected_scenario_index: int = Field(ge=0, strict=True)
+
+
 class EvaluationResult(_EvaluationModel):
-    """Per-case predictions and explicit prediction-to-label associations.
+    """Per-case predictions and explicit finding and test-scenario matches.
 
     Predictions and labels absent from ``finding_matches`` are false positives
-    and missed findings, respectively.
+    and missed findings, respectively. Recommendations use their separate
+    ``test_scenario_matches`` associations; unmatched predictions and expected
+    scenarios are false positives and missed recommendations, respectively.
     """
 
     case_id: CaseIdentifier
     predicted_findings: tuple[AIFindingCandidate, ...] = Field(max_length=50)
     finding_matches: tuple[FindingMatch, ...] = ()
+    predicted_test_scenarios: tuple[NonBlankText, ...] = Field(
+        default=(),
+        max_length=50,
+    )
+    test_scenario_matches: tuple[TestScenarioMatch, ...] = ()
 
     @model_validator(mode="after")
     def validate_unique_finding_matches(self) -> EvaluationResult:
@@ -257,6 +268,21 @@ class EvaluationResult(_EvaluationModel):
         if len(ground_truth_ids) != len(set(ground_truth_ids)):
             raise ValueError(
                 "A ground-truth finding cannot match multiple predictions."
+            )
+
+        predicted_scenario_indexes = tuple(
+            match.predicted_scenario_index for match in self.test_scenario_matches
+        )
+        expected_scenario_indexes = tuple(
+            match.expected_scenario_index for match in self.test_scenario_matches
+        )
+        if len(predicted_scenario_indexes) != len(set(predicted_scenario_indexes)):
+            raise ValueError(
+                "A predicted test scenario cannot match multiple expected scenarios."
+            )
+        if len(expected_scenario_indexes) != len(set(expected_scenario_indexes)):
+            raise ValueError(
+                "An expected test scenario cannot match multiple predictions."
             )
         return self
 
@@ -296,6 +322,22 @@ class EvaluationRun(_EvaluationModel):
                 if match.predicted_finding_index >= len(result.predicted_findings):
                     raise ValueError(
                         "Finding match indexes must reference a predicted finding."
+                    )
+
+            for scenario_match in result.test_scenario_matches:
+                if scenario_match.predicted_scenario_index >= len(
+                    result.predicted_test_scenarios
+                ):
+                    raise ValueError(
+                        "Test scenario match indexes must reference a predicted "
+                        "scenario."
+                    )
+                if scenario_match.expected_scenario_index >= len(
+                    case.recommended_test_scenarios
+                ):
+                    raise ValueError(
+                        "Test scenario match indexes must reference an expected "
+                        "scenario."
                     )
 
         if self.is_complete:
