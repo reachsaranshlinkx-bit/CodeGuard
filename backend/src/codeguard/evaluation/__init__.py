@@ -19,14 +19,23 @@ from codeguard.evaluation.metrics import (
     TestRecommendationMetrics,
     calculate_evaluation_metrics,
 )
+from codeguard.evaluation.reports import (
+    EvaluationCaseLimitations,
+    EvaluationReport,
+    build_evaluation_report,
+    render_json_report,
+    render_markdown_report,
+)
 
 __all__ = [
     "EVALUATION_SCHEMA_VERSION",
     "CaseEvaluationMetrics",
     "CoreMetrics",
     "EvaluationCase",
+    "EvaluationCaseLimitations",
     "EvaluationDataset",
     "EvaluationMetrics",
+    "EvaluationReport",
     "EvaluationResult",
     "EvaluationRun",
     "ExpectedFinding",
@@ -35,5 +44,8 @@ __all__ = [
     "TestRecommendationMetrics",
     "TestScenarioMatch",
     "calculate_evaluation_metrics",
+    "build_evaluation_report",
     "load_evaluation_dataset",
+    "render_json_report",
+    "render_markdown_report",
 ]
