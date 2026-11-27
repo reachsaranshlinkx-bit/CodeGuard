@@ -226,14 +226,39 @@ class EvaluationDataset(_EvaluationModel):
         return self
 
 
+class FindingMatch(_EvaluationModel):
+    """Explicit one-to-one association between one prediction and one label."""
+
+    predicted_finding_index: int = Field(ge=0, strict=True)
+    ground_truth_finding_id: FindingIdentifier
+
+
 class EvaluationResult(_EvaluationModel):
-    """Per-case predictions and explicit references to labelled findings."""
+    """Per-case predictions and explicit prediction-to-label associations.
+
+    Predictions and labels absent from ``finding_matches`` are false positives
+    and missed findings, respectively.
+    """
 
     case_id: CaseIdentifier
     predicted_findings: tuple[AIFindingCandidate, ...] = Field(max_length=50)
-    matched_ground_truth_ids: tuple[FindingIdentifier, ...] = ()
-    missed_ground_truth_ids: tuple[FindingIdentifier, ...] = ()
-    false_positive_finding_indexes: tuple[int, ...] = ()
+    finding_matches: tuple[FindingMatch, ...] = ()
+
+    @model_validator(mode="after")
+    def validate_unique_finding_matches(self) -> EvaluationResult:
+        predicted_indexes = tuple(
+            match.predicted_finding_index for match in self.finding_matches
+        )
+        ground_truth_ids = tuple(
+            match.ground_truth_finding_id for match in self.finding_matches
+        )
+        if len(predicted_indexes) != len(set(predicted_indexes)):
+            raise ValueError("A predicted finding cannot match multiple labels.")
+        if len(ground_truth_ids) != len(set(ground_truth_ids)):
+            raise ValueError(
+                "A ground-truth finding cannot match multiple predictions."
+            )
+        return self
 
 
 class EvaluationRun(_EvaluationModel):
@@ -244,6 +269,7 @@ class EvaluationRun(_EvaluationModel):
     started_at: datetime
     system_name: NonBlankText = Field(max_length=200)
     system_version: NonBlankText = Field(max_length=100)
+    is_complete: bool = True
     results: tuple[EvaluationResult, ...]
 
     @model_validator(mode="after")
@@ -261,32 +287,22 @@ class EvaluationRun(_EvaluationModel):
                 )
 
             expected_ids = {finding.finding_id for finding in case.expected_findings}
-            matched_ids = result.matched_ground_truth_ids
-            missed_ids = result.missed_ground_truth_ids
-            if len(matched_ids) != len(set(matched_ids)):
-                raise ValueError("Matched ground-truth IDs must be unique.")
-            if len(missed_ids) != len(set(missed_ids)):
-                raise ValueError("Missed ground-truth IDs must be unique.")
-            if set(matched_ids) & set(missed_ids):
-                raise ValueError(
-                    "A ground-truth finding cannot be both matched and missed."
-                )
-            referenced_ids = set(matched_ids) | set(missed_ids)
-            if not referenced_ids <= expected_ids:
-                raise ValueError(
-                    f"Evaluation result for {result.case_id!r} references an "
-                    "unknown ground-truth finding."
-                )
+            for match in result.finding_matches:
+                if match.ground_truth_finding_id not in expected_ids:
+                    raise ValueError(
+                        f"Evaluation result for {result.case_id!r} references an "
+                        "unknown ground-truth finding."
+                    )
+                if match.predicted_finding_index >= len(result.predicted_findings):
+                    raise ValueError(
+                        "Finding match indexes must reference a predicted finding."
+                    )
 
-            false_positive_indexes = result.false_positive_finding_indexes
-            if len(false_positive_indexes) != len(set(false_positive_indexes)):
-                raise ValueError("False-positive finding indexes must be unique.")
-            if any(
-                index < 0 or index >= len(result.predicted_findings)
-                for index in false_positive_indexes
-            ):
+        if self.is_complete:
+            missing_case_ids = set(cases_by_id) - set(result_case_ids)
+            if missing_case_ids:
                 raise ValueError(
-                    "False-positive indexes must reference a predicted finding."
+                    "A complete evaluation run must include every dataset case."
                 )
 
         return self
