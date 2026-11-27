@@ -1,7 +1,30 @@
+from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 
 from codeguard.ai.contracts import AIReviewInput, AIReviewResult
 from codeguard.ai.execution_metadata import AIExecutionMetadata
+from codeguard.ai.telemetry import AIProviderUsage
+
+
+@dataclass(frozen=True, slots=True)
+class AIProviderExecutionResult:
+    """Review result and optional per-request metadata from an instrumented provider."""
+
+    review_result: AIReviewResult
+    usage: AIProviderUsage | None
+    request_duration_ms: float
+    provider_identity: str | None = None
+    model_identity: str | None = None
+
+
+@runtime_checkable
+class InstrumentedAIReviewProvider(Protocol):
+    """Optional capability that reports metadata for this specific provider call."""
+
+    async def review_with_telemetry(
+        self,
+        review_input: AIReviewInput,
+    ) -> AIProviderExecutionResult: ...
 
 
 class AIReviewProvider(Protocol):

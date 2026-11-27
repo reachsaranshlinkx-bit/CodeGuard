@@ -12,6 +12,8 @@ from codeguard.ai.engine import AIReviewEngine
 from codeguard.ai.evidence_matching import EvidenceMatchStatus
 from codeguard.ai.evidence_validation import EvidenceLocationReason
 from codeguard.ai.mock_provider import MockAIReviewProvider
+from codeguard.ai.provider import AIProviderExecutionResult
+from codeguard.ai.telemetry import AIProviderUsage
 from codeguard.context.file_discovery import DiscoveredPythonFile
 from codeguard.context.source_snapshot import (
     RepositorySourceFile,
@@ -92,7 +94,49 @@ async def test_engine_returns_verified_provider_result() -> None:
     assert len(result.assessments) == 1
     assert result.assessments[0].candidate == configured_result.findings[0]
     assert result.assessments[0].evidence_match.status == EvidenceMatchStatus.MATCHED
+    assert result.telemetry is not None
+    assert result.telemetry.measurement_source == "runtime"
+    assert result.telemetry.provider_request_duration_ms is None
+    assert result.telemetry.total_ai_execution_duration_ms is not None
     assert provider.reviewed_inputs == (review_input,)
+
+
+@pytest.mark.asyncio
+async def test_engine_accepts_optional_instrumented_provider_capability() -> None:
+    class InstrumentedProvider:
+        async def review(self, review_input: AIReviewInput) -> AIReviewResult:
+            return AIReviewResult(summary="Instrumented.", findings=())
+
+        async def review_with_telemetry(
+            self,
+            review_input: AIReviewInput,
+        ) -> AIProviderExecutionResult:
+            return AIProviderExecutionResult(
+                review_result=AIReviewResult(summary="Instrumented.", findings=()),
+                usage=AIProviderUsage(
+                    input_tokens=4,
+                    output_tokens=2,
+                    total_tokens=6,
+                ),
+                request_duration_ms=0.25,
+                provider_identity="test-provider",
+                model_identity="test-model",
+            )
+
+    execution = await AIReviewEngine(InstrumentedProvider()).review(
+        make_review_input(),
+        make_source_snapshot(),
+    )
+
+    assert execution.provider_result.summary == "Instrumented."
+    assert execution.telemetry is not None
+    assert execution.telemetry.provider_identity == "test-provider"
+    assert execution.telemetry.model_identity == "test-model"
+    assert execution.telemetry.provider_usage is not None
+    assert execution.telemetry.provider_usage.total_tokens == 6
+    assert execution.telemetry.provider_request_duration_ms == 0.25
+    assert execution.telemetry.total_ai_execution_duration_ms is not None
+    assert execution.telemetry.total_ai_execution_duration_ms >= 0
 
 
 @pytest.mark.asyncio

@@ -1,5 +1,15 @@
 """Provider-neutral evaluation contracts and golden datasets."""
 
+from codeguard.ai.telemetry import (
+    AICostMetrics,
+    AIDurationMetrics,
+    AIExecutionTelemetry,
+    AIPerformanceMetrics,
+    AIPricingConfiguration,
+    AIProviderUsage,
+    AITokenUsageMetrics,
+    aggregate_ai_telemetry,
+)
 from codeguard.evaluation.contracts import (
     EVALUATION_SCHEMA_VERSION,
     EvaluationCase,
@@ -40,6 +50,13 @@ from codeguard.evaluation.reports import (
 
 __all__ = [
     "EVALUATION_SCHEMA_VERSION",
+    "AICostMetrics",
+    "AIDurationMetrics",
+    "AIExecutionTelemetry",
+    "AIPerformanceMetrics",
+    "AIPricingConfiguration",
+    "AIProviderUsage",
+    "AITokenUsageMetrics",
     "CaseEvaluationMetrics",
     "CoreMetrics",
     "EvaluationCase",
@@ -62,6 +79,7 @@ __all__ = [
     "TestScenarioMatch",
     "calculate_evaluation_metrics",
     "build_evaluation_report",
+    "aggregate_ai_telemetry",
     "compare_evaluation_reports",
     "load_evaluation_dataset",
     "render_json_report",

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
@@ -169,6 +170,92 @@ async def test_review_extracts_and_validates_findings() -> None:
     assert result.summary == "One candidate needs validation."
     assert len(result.findings) == 1
     assert result.findings[0].model_dump() == finding
+
+
+async def test_instrumented_review_extracts_provider_usage() -> None:
+    response_data = make_response(
+        output=[make_message(json.dumps({"summary": "No findings.", "findings": []}))],
+    )
+    response_data["usage"] = {
+        "input_tokens": 25,
+        "output_tokens": 8,
+        "total_tokens": 33,
+        "input_tokens_details": {"cached_tokens": 5},
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=response_data, request=request)
+
+    async with open_test_provider(handler) as provider:
+        execution = await provider.review_with_telemetry(make_input())
+
+    assert execution.review_result.summary == "No findings."
+    assert execution.usage is not None
+    assert execution.usage.input_tokens == 25
+    assert execution.usage.output_tokens == 8
+    assert execution.usage.total_tokens == 33
+    assert execution.usage.cached_input_tokens == 5
+    assert execution.request_duration_ms >= 0
+    assert execution.provider_identity == OPENAI_PROVIDER_IDENTITY
+    assert execution.model_identity == TEST_MODEL
+
+
+@pytest.mark.parametrize(
+    "usage",
+    [
+        None,
+        {"input_tokens": "not-an-integer", "output_tokens": 1, "total_tokens": 2},
+        {"input_tokens": -1, "output_tokens": 1, "total_tokens": 0},
+        {
+            "input_tokens": 1,
+            "output_tokens": 1,
+            "total_tokens": 2,
+            "input_tokens_details": {"cached_tokens": 3},
+        },
+    ],
+)
+async def test_malformed_or_missing_usage_does_not_invalidate_review(
+    usage: object,
+) -> None:
+    response_data = make_response(
+        output=[make_message(json.dumps({"summary": "Still valid.", "findings": []}))],
+    )
+    if usage is not None:
+        response_data["usage"] = usage
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=response_data, request=request)
+
+    async with open_test_provider(handler) as provider:
+        execution = await provider.review_with_telemetry(make_input())
+
+    assert execution.review_result.summary == "Still valid."
+    assert execution.usage is None
+
+
+async def test_concurrent_instrumented_calls_keep_per_response_usage() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        review_context = json.loads(payload["input"][0]["content"][0]["text"])
+        count = int(review_context["repository_and_pull_request_context"])
+        body = make_response(
+            output=[make_message(json.dumps({"summary": "ok", "findings": []}))],
+        )
+        body["usage"] = {
+            "input_tokens": count,
+            "output_tokens": count + 1,
+            "total_tokens": count * 2 + 1,
+        }
+        return httpx.Response(200, json=body, request=request)
+
+    async with open_test_provider(handler) as provider:
+        executions = await asyncio.gather(
+            provider.review_with_telemetry(make_input("3")),
+            provider.review_with_telemetry(make_input("9")),
+        )
+
+    assert [item.usage.input_tokens for item in executions if item.usage] == [3, 9]
+    assert [item.usage.output_tokens for item in executions if item.usage] == [4, 10]
 
 
 @pytest.mark.parametrize(

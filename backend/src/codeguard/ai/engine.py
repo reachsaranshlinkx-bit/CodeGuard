@@ -1,4 +1,6 @@
 from dataclasses import dataclass
+from time import perf_counter_ns
+from typing import cast
 
 from codeguard.ai.contracts import (
     AIFindingCandidate,
@@ -9,7 +11,12 @@ from codeguard.ai.evidence_matching import (
     EvidenceMatcher,
     EvidenceMatchResult,
 )
-from codeguard.ai.provider import AIReviewProvider
+from codeguard.ai.provider import (
+    AIProviderExecutionResult,
+    AIReviewProvider,
+    InstrumentedAIReviewProvider,
+)
+from codeguard.ai.telemetry import AIExecutionTelemetry
 from codeguard.context.source_snapshot import RepositorySourceSnapshot
 
 
@@ -27,6 +34,7 @@ class AIReviewExecutionResult:
 
     provider_result: AIReviewResult
     assessments: tuple[AIReviewFindingAssessment, ...]
+    telemetry: AIExecutionTelemetry | None = None
 
 
 class AIReviewEngine:
@@ -64,7 +72,25 @@ class AIReviewEngine:
         Findings are preserved even when their evidence cannot be verified.
         """
 
-        provider_result = await self._provider.review(review_input)
+        execution_started_ns = perf_counter_ns()
+        instrumented = isinstance(self._provider, InstrumentedAIReviewProvider)
+        provider_execution: AIProviderExecutionResult | None = None
+        if instrumented:
+            instrumented_provider = cast(
+                InstrumentedAIReviewProvider,
+                self._provider,
+            )
+            provider_execution = await instrumented_provider.review_with_telemetry(
+                review_input
+            )
+            if not isinstance(provider_execution, AIProviderExecutionResult):
+                raise TypeError(
+                    "Instrumented AI provider must return an "
+                    "AIProviderExecutionResult instance."
+                )
+            provider_result = provider_execution.review_result
+        else:
+            provider_result = await self._provider.review(review_input)
 
         if not isinstance(provider_result, AIReviewResult):
             raise TypeError(
@@ -87,7 +113,34 @@ class AIReviewEngine:
             for candidate in validated_result.findings
         )
 
+        execution_finished_ns = perf_counter_ns()
+        telemetry = AIExecutionTelemetry(
+            provider_identity=(
+                provider_execution.provider_identity
+                if provider_execution is not None
+                else None
+            ),
+            model_identity=(
+                provider_execution.model_identity
+                if provider_execution is not None
+                else None
+            ),
+            provider_usage=(
+                provider_execution.usage if provider_execution is not None else None
+            ),
+            provider_request_duration_ms=(
+                provider_execution.request_duration_ms
+                if provider_execution is not None
+                else None
+            ),
+            total_ai_execution_duration_ms=(
+                execution_finished_ns - execution_started_ns
+            )
+            / 1_000_000,
+            measurement_source="provider" if instrumented else "runtime",
+        )
         return AIReviewExecutionResult(
             provider_result=validated_result,
             assessments=assessments,
+            telemetry=telemetry,
         )
