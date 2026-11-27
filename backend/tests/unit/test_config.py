@@ -6,6 +6,9 @@ from codeguard.core.config import Settings
 
 def test_settings_use_expected_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("CODEGUARD_AI_PROVIDER", raising=False)
+    monkeypatch.delenv("CODEGUARD_OPENAI_REQUEST_TIMEOUT_SECONDS", raising=False)
+    monkeypatch.delenv("CODEGUARD_WEBHOOK_WORKER_MAX_ATTEMPTS", raising=False)
+    monkeypatch.delenv("CODEGUARD_WEBHOOK_WORKER_RETRY_DELAY_SECONDS", raising=False)
     settings = Settings(_env_file=None)
 
     assert settings.app_name == "CodeGuard API"
@@ -14,6 +17,9 @@ def test_settings_use_expected_defaults(monkeypatch: pytest.MonkeyPatch) -> None
     assert settings.debug is False
     assert settings.log_level == "INFO"
     assert settings.ai_provider == "disabled"
+    assert settings.openai_request_timeout_seconds == 30.0
+    assert settings.webhook_worker_max_attempts == 5
+    assert settings.webhook_worker_retry_delay_seconds == 30
 
 
 @pytest.mark.parametrize("provider", ["disabled", "mock"])
@@ -56,6 +62,38 @@ def test_openai_credentials_do_not_enable_provider_by_themselves() -> None:
     )
 
     assert settings.ai_provider == "disabled"
+
+
+def test_openai_request_timeout_is_loaded_from_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CODEGUARD_OPENAI_REQUEST_TIMEOUT_SECONDS", "7.5")
+
+    settings = Settings(_env_file=None)
+
+    assert settings.openai_request_timeout_seconds == 7.5
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "nan", "inf", "-inf"])
+def test_openai_request_timeout_rejects_nonpositive_or_nonfinite_values(
+    monkeypatch: pytest.MonkeyPatch,
+    value: str,
+) -> None:
+    monkeypatch.setenv("CODEGUARD_OPENAI_REQUEST_TIMEOUT_SECONDS", value)
+
+    with pytest.raises(
+        ValidationError,
+        match="CODEGUARD_OPENAI_REQUEST_TIMEOUT_SECONDS",
+    ):
+        Settings(_env_file=None)
+
+
+def test_openai_request_timeout_rejects_boolean_values() -> None:
+    with pytest.raises(ValidationError):
+        Settings(
+            _env_file=None,
+            openai_request_timeout_seconds=True,  # type: ignore[arg-type]
+        )
 
 
 def test_ai_provider_rejects_unsupported_environment_value(
@@ -292,11 +330,15 @@ def test_webhook_worker_settings_use_safe_defaults(
         "CODEGUARD_WEBHOOK_WORKER_POLL_INTERVAL_SECONDS",
         raising=False,
     )
+    monkeypatch.delenv("CODEGUARD_WEBHOOK_WORKER_MAX_ATTEMPTS", raising=False)
+    monkeypatch.delenv("CODEGUARD_WEBHOOK_WORKER_RETRY_DELAY_SECONDS", raising=False)
 
     settings = Settings(_env_file=None)
 
     assert settings.webhook_worker_enabled is False
     assert settings.webhook_worker_poll_interval_seconds == 1
+    assert settings.webhook_worker_max_attempts == 5
+    assert settings.webhook_worker_retry_delay_seconds == 30
 
 
 def test_webhook_worker_settings_load_environment_variables(
@@ -307,11 +349,64 @@ def test_webhook_worker_settings_load_environment_variables(
         "CODEGUARD_WEBHOOK_WORKER_POLL_INTERVAL_SECONDS",
         "3",
     )
+    monkeypatch.setenv("CODEGUARD_WEBHOOK_WORKER_MAX_ATTEMPTS", "4")
+    monkeypatch.setenv("CODEGUARD_WEBHOOK_WORKER_RETRY_DELAY_SECONDS", "12")
 
     settings = Settings(_env_file=None)
 
     assert settings.webhook_worker_enabled is True
     assert settings.webhook_worker_poll_interval_seconds == 3
+    assert settings.webhook_worker_max_attempts == 4
+    assert settings.webhook_worker_retry_delay_seconds == 12
+
+
+@pytest.mark.parametrize(
+    ("environment_name", "value", "error_message"),
+    [
+        (
+            "CODEGUARD_WEBHOOK_WORKER_MAX_ATTEMPTS",
+            "0",
+            "CODEGUARD_WEBHOOK_WORKER_MAX_ATTEMPTS",
+        ),
+        (
+            "CODEGUARD_WEBHOOK_WORKER_MAX_ATTEMPTS",
+            "-1",
+            "CODEGUARD_WEBHOOK_WORKER_MAX_ATTEMPTS",
+        ),
+        (
+            "CODEGUARD_WEBHOOK_WORKER_RETRY_DELAY_SECONDS",
+            "-1",
+            "CODEGUARD_WEBHOOK_WORKER_RETRY_DELAY_SECONDS",
+        ),
+    ],
+)
+def test_webhook_worker_rejects_invalid_retry_controls(
+    monkeypatch: pytest.MonkeyPatch,
+    environment_name: str,
+    value: str,
+    error_message: str,
+) -> None:
+    monkeypatch.setenv(environment_name, value)
+
+    with pytest.raises(ValidationError, match=error_message):
+        Settings(_env_file=None)
+
+
+@pytest.mark.parametrize(
+    "setting_name",
+    [
+        "webhook_worker_max_attempts",
+        "webhook_worker_retry_delay_seconds",
+    ],
+)
+def test_webhook_worker_retry_controls_reject_boolean_values(
+    setting_name: str,
+) -> None:
+    with pytest.raises(ValidationError):
+        Settings(
+            _env_file=None,
+            **{setting_name: True},
+        )
 
 
 def test_webhook_worker_rejects_invalid_poll_interval(

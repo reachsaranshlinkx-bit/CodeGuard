@@ -112,6 +112,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             worker = WebhookJobWorker(
                 queue=app.state.webhook_job_queue,
                 processor=processor,
+                max_attempts=app_settings.webhook_worker_max_attempts,
+                retry_delay_seconds=app_settings.webhook_worker_retry_delay_seconds,
             )
 
             app.state.webhook_worker = worker

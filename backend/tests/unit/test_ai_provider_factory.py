@@ -74,3 +74,22 @@ def test_openai_factory_selects_configured_provider_without_network_access() -> 
     assert selection.metadata.provider_identity == "openai"
     assert selection.metadata.model_identity == "gpt-test-model"
     assert "test-openai-secret" not in repr(selection.provider)
+
+
+async def test_openai_factory_passes_configured_request_timeout() -> None:
+    settings = Settings(
+        _env_file=None,
+        environment="testing",
+        ai_provider="openai",
+        openai_api_key="test-openai-secret",
+        openai_model="gpt-test-model",
+        openai_request_timeout_seconds=7.5,
+    )
+
+    selection = create_ai_review_provider_selection(settings)
+    assert selection is not None
+    assert isinstance(selection.provider, OpenAIReviewProvider)
+    assert selection.provider._client._client.timeout.connect == 7.5
+    assert selection.provider._client._client.timeout.read == 7.5
+
+    await selection.aclose()

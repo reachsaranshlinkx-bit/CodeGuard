@@ -280,11 +280,14 @@ def test_webhook_worker_retries_failed_processing(
         *,
         queue,
         processor,
+        max_attempts: int,
+        retry_delay_seconds: int,
     ) -> WebhookJobWorker:
         return original_worker_class(
             queue=queue,
             processor=processor,
-            retry_delay_seconds=0,
+            max_attempts=max_attempts,
+            retry_delay_seconds=retry_delay_seconds,
         )
 
     monkeypatch.setattr(
@@ -308,6 +311,7 @@ def test_webhook_worker_retries_failed_processing(
         github_webhook_secret=SecretStr(SECRET),
         webhook_worker_enabled=True,
         webhook_worker_poll_interval_seconds=1,
+        webhook_worker_retry_delay_seconds=0,
         webhook_database_path=tmp_path / "webhook_retry.sqlite3",
     )
 
@@ -439,12 +443,14 @@ def test_webhook_worker_stops_after_maximum_attempts(
         *,
         queue,
         processor,
+        max_attempts: int,
+        retry_delay_seconds: int,
     ) -> WebhookJobWorker:
         return original_worker_class(
             queue=queue,
             processor=processor,
-            retry_delay_seconds=0,
-            max_attempts=2,
+            max_attempts=max_attempts,
+            retry_delay_seconds=retry_delay_seconds,
         )
 
     monkeypatch.setattr(
@@ -468,6 +474,8 @@ def test_webhook_worker_stops_after_maximum_attempts(
         github_webhook_secret=SecretStr(SECRET),
         webhook_worker_enabled=True,
         webhook_worker_poll_interval_seconds=1,
+        webhook_worker_max_attempts=2,
+        webhook_worker_retry_delay_seconds=0,
         webhook_database_path=tmp_path / "webhook_exhaustion.sqlite3",
     )
 

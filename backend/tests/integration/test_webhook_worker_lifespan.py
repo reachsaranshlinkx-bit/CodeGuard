@@ -285,10 +285,12 @@ def test_openai_provider_is_selected_injected_and_closed_during_lifespan(
             *,
             model_identity: str,
             api_key: SecretStr | str,
+            timeout: float = 30.0,
         ) -> None:
             super().__init__(
                 model_identity=model_identity,
                 api_key=api_key,
+                timeout=timeout,
                 transport=httpx.MockTransport(provider_transport),
             )
             created_providers.append(self)
@@ -331,7 +333,10 @@ def test_openai_provider_is_selected_injected_and_closed_during_lifespan(
         ai_provider="openai",
         openai_api_key="test-openai-key-not-a-real-credential",
         openai_model="gpt-test-model",
+        openai_request_timeout_seconds=8.5,
         webhook_worker_enabled=True,
+        webhook_worker_max_attempts=3,
+        webhook_worker_retry_delay_seconds=11,
         webhook_database_path=tmp_path / "openai-provider-lifecycle.sqlite3",
     )
     app = main.create_app(settings=settings)
@@ -348,7 +353,10 @@ def test_openai_provider_is_selected_injected_and_closed_during_lifespan(
         assert (
             coordinator._provider_selection.metadata.model_identity == "gpt-test-model"
         )
+        assert app.state.webhook_worker._max_attempts == 3
+        assert app.state.webhook_worker._retry_delay_seconds == 11
         assert created_providers[0]._client._client.is_closed is False
+        assert created_providers[0]._client._client.timeout.connect == 8.5
         assert provider_requests == []
 
     assert created_providers[0]._client._client.is_closed is True
