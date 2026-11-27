@@ -1,0 +1,563 @@
+{
+  "schema_version": "1.0",
+  "dataset_id": "python-pr-golden",
+  "dataset_version": "1.0.0",
+  "title": "Synthetic Python pull request review golden set",
+  "description": "Human-authored synthetic pull requests for provider-neutral review evaluation.",
+  "scope_statement": "Labels apply only to the supplied pull request description, changed-file diff, and base/head source snapshots. A negative case means no supported issue is labelled in that bounded input; it does not establish that the wider repository or application is free of defects.",
+  "cases": [
+    {
+      "case_id": "untrusted-eval-input",
+      "category": "security",
+      "case_type": "positive",
+      "description": "A changed expression parser executes caller-controlled text as Python code.",
+      "pull_request": {
+        "title": "Add expression parsing",
+        "description": "Adds a helper that accepts an expression from a caller and returns its evaluated value."
+      },
+      "base_snapshot": {
+        "commit_sha": "0000000000000000000000000000000000000001",
+        "files": [
+          {
+            "path": "src/expression.py",
+            "content": "def parse_expression(value: str) -> int:\n    return int(value)\n"
+          }
+        ]
+      },
+      "head_snapshot": {
+        "commit_sha": "0000000000000000000000000000000000000002",
+        "files": [
+          {
+            "path": "src/expression.py",
+            "content": "def parse_expression(value: str) -> int:\n    return eval(value)\n"
+          }
+        ]
+      },
+      "changed_files": [
+        {
+          "path": "src/expression.py",
+          "status": "modified",
+          "additions": 1,
+          "deletions": 1,
+          "patch": "@@ -1,2 +1,2 @@\n def parse_expression(value: str) -> int:\n-    return int(value)\n+    return eval(value)\n"
+        }
+      ],
+      "expected_findings": [
+        {
+          "finding_id": "dynamic-execution",
+          "finding": {
+            "title": "Untrusted input is evaluated as Python code",
+            "severity": "high",
+            "confidence": "high",
+            "file_path": "src/expression.py",
+            "line_number": 2,
+            "problem": "The function passes caller-controlled text to eval, allowing input to execute as Python expressions.",
+            "evidence": "    return eval(value)",
+            "why_it_matters": "An attacker able to control value may execute unintended code in the service process.",
+            "suggested_fix": "Parse the supported expression grammar without evaluating arbitrary Python.",
+            "recommended_validation": "Test that arithmetic input is accepted while names, calls, and other executable expressions are rejected."
+          },
+          "rationale": "The changed line evaluates its parameter directly; the input is not constrained to a literal or parsed grammar."
+        }
+      ],
+      "recommended_test_scenarios": [
+        "Pass a value containing a function call and verify it is rejected without execution.",
+        "Verify all documented arithmetic expressions still parse."
+      ],
+      "analysis_limitations": [
+        "The case does not specify every caller or the trust boundary for value; the direct evaluation of the parameter is the labelled issue."
+      ]
+    },
+    {
+      "case_id": "shell-command-interpolation",
+      "category": "security",
+      "case_type": "positive",
+      "description": "A user-controlled tool name is interpolated into a shell command.",
+      "pull_request": {
+        "title": "Add tool execution helper",
+        "description": "Runs a selected tool with a caller-provided name."
+      },
+      "base_snapshot": {
+        "commit_sha": "0000000000000000000000000000000000000011",
+        "files": [
+          {
+            "path": "src/tool_runner.py",
+            "content": "import subprocess\n\ndef run_tool(name: str) -> None:\n    subprocess.run([\"tool\", name], check=True)\n"
+          }
+        ]
+      },
+      "head_snapshot": {
+        "commit_sha": "0000000000000000000000000000000000000012",
+        "files": [
+          {
+            "path": "src/tool_runner.py",
+            "content": "import subprocess\n\ndef run_tool(name: str) -> None:\n    subprocess.run(f\"tool {name}\", shell=True, check=True)\n"
+          }
+        ]
+      },
+      "changed_files": [
+        {
+          "path": "src/tool_runner.py",
+          "status": "modified",
+          "additions": 1,
+          "deletions": 1,
+          "patch": "@@ -3,2 +3,2 @@\n def run_tool(name: str) -> None:\n-    subprocess.run([\"tool\", name], check=True)\n+    subprocess.run(f\"tool {name}\", shell=True, check=True)\n"
+        }
+      ],
+      "expected_findings": [
+        {
+          "finding_id": "shell-injection",
+          "finding": {
+            "title": "Caller input is interpolated into a shell command",
+            "severity": "high",
+            "confidence": "high",
+            "file_path": "src/tool_runner.py",
+            "line_number": 4,
+            "problem": "The helper interpolates name into a command string and asks the shell to interpret it.",
+            "evidence": "    subprocess.run(f\"tool {name}\", shell=True, check=True)",
+            "why_it_matters": "Shell metacharacters in name may alter the command and execute unintended operations.",
+            "suggested_fix": "Pass a sequence of arguments to subprocess with shell disabled.",
+            "recommended_validation": "Test names containing spaces and shell metacharacters and assert they remain one literal argument."
+          },
+          "rationale": "The interpolated argument reaches a shell-enabled subprocess call."
+        }
+      ],
+      "recommended_test_scenarios": [
+        "Verify a name containing shell metacharacters is passed as one literal argument.",
+        "Assert the subprocess call does not enable shell interpretation."
+      ],
+      "analysis_limitations": [
+        "The case does not define the complete set of allowed tool names or the operating system."
+      ]
+    },
+    {
+      "case_id": "unsafe-yaml-deserialization",
+      "category": "security",
+      "case_type": "positive",
+      "description": "A configuration helper uses yaml.load without a safe loader.",
+      "pull_request": {
+        "title": "Load YAML configuration",
+        "description": "Adds a helper for parsing YAML configuration received by the service."
+      },
+      "base_snapshot": {
+        "commit_sha": "0000000000000000000000000000000000000021",
+        "files": [
+          {
+            "path": "src/config_loader.py",
+            "content": "import yaml\n\ndef load_config(data: str) -> object:\n    return yaml.safe_load(data)\n"
+          }
+        ]
+      },
+      "head_snapshot": {
+        "commit_sha": "0000000000000000000000000000000000000022",
+        "files": [
+          {
+            "path": "src/config_loader.py",
+            "content": "import yaml\n\ndef load_config(data: str) -> object:\n    return yaml.load(data, Loader=yaml.UnsafeLoader)\n"
+          }
+        ]
+      },
+      "changed_files": [
+        {
+          "path": "src/config_loader.py",
+          "status": "modified",
+          "additions": 1,
+          "deletions": 1,
+          "patch": "@@ -3,2 +3,2 @@\n def load_config(data: str) -> object:\n-    return yaml.safe_load(data)\n+    return yaml.load(data, Loader=yaml.UnsafeLoader)\n"
+
+        }
+      ],
+      "expected_findings": [
+        {
+          "finding_id": "unsafe-yaml-loader",
+          "finding": {
+            "title": "YAML input is loaded without a safe loader",
+            "severity": "high",
+            "confidence": "high",
+            "file_path": "src/config_loader.py",
+            "line_number": 4,
+            "problem": "yaml.load is called without a loader that restricts construction to safe data types.",
+            "evidence": "    return yaml.load(data, Loader=yaml.UnsafeLoader)",
+            "why_it_matters": "Untrusted YAML may construct Python objects with unsafe behavior.",
+            "suggested_fix": "Use yaml.safe_load or explicitly pass a reviewed safe loader.",
+            "recommended_validation": "Test ordinary mappings and a payload representing an unsafe Python object."
+          },
+          "rationale": "The call omits a safe loader and the pull request describes parsing received configuration."
+        }
+      ],
+      "recommended_test_scenarios": [
+        "Parse ordinary mapping and sequence values.",
+        "Verify unsafe object construction is rejected."
+      ],
+      "analysis_limitations": [
+        "The source does not establish whether data is always trusted; the helper accepts arbitrary input and does not constrain the loader."
+      ]
+    },
+    {
+      "case_id": "untrusted-pickle-payload",
+      "category": "security",
+      "case_type": "positive",
+      "description": "A changed cache helper deserializes a payload from an external source with pickle.",
+      "pull_request": {
+        "title": "Read cached objects",
+        "description": "Adds support for loading serialized cache values supplied by the cache backend."
+      },
+      "base_snapshot": {
+        "commit_sha": "0000000000000000000000000000000000000031",
+        "files": [
+          {
+            "path": "src/cache_reader.py",
+            "content": "import json\n\ndef decode(payload: str) -> object:\n    return json.loads(payload)\n"
+          }
+        ]
+      },
+      "head_snapshot": {
+        "commit_sha": "0000000000000000000000000000000000000032",
+        "files": [
+          {
+            "path": "src/cache_reader.py",
+            "content": "import pickle\n\ndef decode(payload: bytes) -> object:\n    return pickle.loads(payload)\n"
+          }
+        ]
+      },
+      "changed_files": [
+        {
+          "path": "src/cache_reader.py",
+          "status": "modified",
+          "additions": 3,
+          "deletions": 3,
+          "patch": "@@ -1,4 +1,4 @@\n-import json\n+import pickle\n \n-def decode(payload: str) -> object:\n-    return json.loads(payload)\n+def decode(payload: bytes) -> object:\n+    return pickle.loads(payload)\n"
+        }
+      ],
+      "expected_findings": [
+        {
+          "finding_id": "unsafe-pickle",
+          "finding": {
+            "title": "Serialized input is deserialized with pickle",
+            "severity": "high",
+            "confidence": "high",
+            "file_path": "src/cache_reader.py",
+            "line_number": 4,
+            "problem": "The helper passes backend-provided bytes to pickle.loads.",
+            "evidence": "    return pickle.loads(payload)",
+            "why_it_matters": "A crafted pickle can execute code during deserialization.",
+            "suggested_fix": "Use a data-only serialization format or authenticate and tightly constrain the serialized source.",
+            "recommended_validation": "Test supported cache values using a data-only format and reject arbitrary object payloads."
+          },
+          "rationale": "The PR describes an external cache backend and the changed line directly unpickles its bytes."
+        }
+      ],
+      "recommended_test_scenarios": [
+        "Verify supported cache values round-trip using a data-only encoding.",
+        "Ensure data received from an untrusted backend cannot trigger object construction."
+      ],
+      "analysis_limitations": [
+        "The trust guarantees of the cache backend are not specified; the label assumes it can return attacker-influenced bytes as described."
+      ]
+    },
+    {
+      "case_id": "swallowed-storage-failure",
+      "category": "error_handling",
+      "case_type": "positive",
+      "description": "A write failure is converted into a success-shaped return value.",
+      "pull_request": {
+        "title": "Make record storage resilient",
+        "description": "Changes storage error handling so callers can continue after a write exception."
+      },
+      "base_snapshot": {
+        "commit_sha": "0000000000000000000000000000000000000041",
+        "files": [
+          {
+            "path": "src/records.py",
+            "content": "def save_record(store, record):\n    try:\n        store.write(record)\n    except OSError:\n        raise\n    return True\n"
+          }
+        ]
+      },
+      "head_snapshot": {
+        "commit_sha": "0000000000000000000000000000000000000042",
+        "files": [
+          {
+            "path": "src/records.py",
+            "content": "def save_record(store, record):\n    try:\n        store.write(record)\n    except Exception:\n        return True\n    return True\n"
+          }
+        ]
+      },
+      "changed_files": [
+        {
+          "path": "src/records.py",
+          "status": "modified",
+          "additions": 2,
+          "deletions": 2,
+          "patch": "@@ -1,5 +1,5 @@\n def save_record(store, record):\n     try:\n         store.write(record)\n-    except OSError:\n-        raise\n+    except Exception:\n+        return True\n     return True\n"
+        }
+      ],
+      "expected_findings": [
+        {
+          "finding_id": "storage-error-reported-as-success",
+          "finding": {
+            "title": "Storage failures are reported as successful writes",
+            "severity": "medium",
+            "confidence": "high",
+            "file_path": "src/records.py",
+            "line_number": 5,
+            "problem": "The broad exception handler returns True even when store.write raises.",
+            "evidence": "        return True",
+            "why_it_matters": "Callers may believe a record was persisted when the write failed.",
+            "suggested_fix": "Propagate the failure or return an explicit failure result that callers must handle.",
+            "recommended_validation": "Make the store raise an OSError and verify the caller observes a failed write."
+          },
+          "rationale": "The changed handler suppresses all exceptions and returns the same success value as the successful path."
+        }
+      ],
+      "recommended_test_scenarios": [
+        "Make store.write raise OSError and assert the failure is observable.",
+        "Verify a successful write still returns the documented success result."
+      ],
+      "analysis_limitations": [
+        "No caller contract is included; the labelled defect is specifically the indistinguishable success return after an exception."
+      ]
+    },
+    {
+      "case_id": "unbounded-read-retry",
+      "category": "reliability",
+      "case_type": "positive",
+      "description": "A bounded retry loop is changed to retry forever without delay.",
+      "pull_request": {
+        "title": "Retry configuration reads",
+        "description": "Attempts to make transient configuration read failures recover automatically."
+      },
+      "base_snapshot": {
+        "commit_sha": "0000000000000000000000000000000000000051",
+        "files": [
+          {
+            "path": "src/config_reader.py",
+            "content": "def read_config(path):\n    for attempt in range(3):\n        try:\n            return open(path).read()\n        except OSError:\n            continue\n"
+          }
+        ]
+      },
+      "head_snapshot": {
+        "commit_sha": "0000000000000000000000000000000000000052",
+        "files": [
+          {
+            "path": "src/config_reader.py",
+            "content": "def read_config(path):\n    while True:\n        try:\n            return open(path).read()\n        except OSError:\n            continue\n"
+          }
+        ]
+      },
+      "changed_files": [
+        {
+          "path": "src/config_reader.py",
+          "status": "modified",
+          "additions": 1,
+          "deletions": 1,
+          "patch": "@@ -1,3 +1,3 @@\n def read_config(path):\n-    for attempt in range(3):\n+    while True:\n         try:\n"
+        }
+      ],
+      "expected_findings": [
+        {
+          "finding_id": "unbounded-retry",
+          "finding": {
+            "title": "Configuration reads can retry without a bound",
+            "severity": "medium",
+            "confidence": "high",
+            "file_path": "src/config_reader.py",
+            "line_number": 2,
+            "problem": "The loop retries every OSError forever and immediately continues without a retry limit or delay.",
+            "evidence": "    while True:",
+            "why_it_matters": "A persistent error can consume a worker indefinitely and prevent shutdown or other work.",
+            "suggested_fix": "Use a finite retry budget with appropriate delay and propagate the final error.",
+            "recommended_validation": "Simulate persistent and transient OSError cases and verify bounded attempts and termination."
+          },
+          "rationale": "The changed loop removes the explicit three-attempt bound while retaining an immediate retry on every OSError."
+        }
+      ],
+      "recommended_test_scenarios": [
+        "Simulate a persistent OSError and assert the operation terminates after a bounded number of attempts.",
+        "Verify a transient error can recover within the retry budget."
+      ],
+      "analysis_limitations": [
+        "The case does not include application-level retry policy or shutdown requirements; it labels the unbounded tight loop in the supplied function."
+      ]
+    },
+    {
+      "case_id": "safe-subprocess-arguments",
+      "category": "safe_pattern",
+      "case_type": "negative",
+      "description": "A suspicious subprocess call safely passes user input as a separate argument.",
+      "pull_request": {
+        "title": "Run a named tool",
+        "description": "Adds a wrapper that passes the requested tool name to a subprocess."
+      },
+      "base_snapshot": {
+        "commit_sha": "0000000000000000000000000000000000000061",
+        "files": [
+          {
+            "path": "src/tool_runner.py",
+            "content": "import subprocess\n\ndef run_tool(name: str) -> None:\n    subprocess.run([\"tool\", name], shell=False, check=True)\n"
+          }
+        ]
+      },
+      "head_snapshot": {
+        "commit_sha": "0000000000000000000000000000000000000062",
+        "files": [
+          {
+            "path": "src/tool_runner.py",
+            "content": "import subprocess\n\ndef run_tool(name: str) -> None:\n    subprocess.run([\"tool\", name], check=True)\n"
+          }
+        ]
+      },
+      "changed_files": [
+        {
+          "path": "src/tool_runner.py",
+          "status": "modified",
+          "additions": 1,
+          "deletions": 1,
+          "patch": "@@ -3,2 +3,2 @@\n def run_tool(name: str) -> None:\n-    subprocess.run([\"tool\", name], shell=False, check=True)\n+    subprocess.run([\"tool\", name], check=True)\n"
+        }
+      ],
+      "expected_findings": [],
+      "recommended_test_scenarios": [
+        "Pass a name containing spaces or shell metacharacters and confirm it remains a single argument."
+      ],
+      "analysis_limitations": [
+        "No supported issue is labelled in this changed helper; the empty label says nothing about other files or other repository behavior."
+      ]
+    },
+    {
+      "case_id": "safe-yaml-loader",
+      "category": "safe_pattern",
+      "case_type": "negative",
+      "description": "The changed parser explicitly uses PyYAML's SafeLoader.",
+      "pull_request": {
+        "title": "Parse YAML configuration",
+        "description": "Adds a wrapper around safe YAML parsing for configuration data."
+      },
+      "base_snapshot": {
+        "commit_sha": "0000000000000000000000000000000000000071",
+        "files": [
+          {
+            "path": "src/config_loader.py",
+            "content": "import yaml\n\ndef load_config(data: str) -> object:\n    return yaml.load(data, Loader=yaml.UnsafeLoader)\n"
+          }
+        ]
+      },
+      "head_snapshot": {
+        "commit_sha": "0000000000000000000000000000000000000072",
+        "files": [
+          {
+            "path": "src/config_loader.py",
+            "content": "import yaml\n\ndef load_config(data: str) -> object:\n    return yaml.load(data, Loader=yaml.SafeLoader)\n"
+          }
+        ]
+      },
+      "changed_files": [
+        {
+          "path": "src/config_loader.py",
+          "status": "modified",
+          "additions": 1,
+          "deletions": 1,
+          "patch": "@@ -3,2 +3,2 @@\n def load_config(data: str) -> object:\n-    return yaml.load(data, Loader=yaml.UnsafeLoader)\n+    return yaml.load(data, Loader=yaml.SafeLoader)\n"
+        }
+      ],
+      "expected_findings": [],
+      "recommended_test_scenarios": [
+        "Parse ordinary YAML mappings.",
+        "Verify Python-specific object tags are not constructed."
+      ],
+      "analysis_limitations": [
+        "No supported issue is labelled in this changed line because the safe loader is explicit; this is not a repository-wide assurance."
+      ]
+    },
+    {
+      "case_id": "constant-eval-edge-case",
+      "category": "edge_case",
+      "case_type": "negative",
+      "description": "The code uses eval with a fixed source literal rather than caller-controlled input.",
+      "pull_request": {
+        "title": "Evaluate a fixed numeric constant",
+        "description": "Changes a literal conversion to evaluate a constant expression that is part of the source."
+      },
+      "base_snapshot": {
+        "commit_sha": "0000000000000000000000000000000000000081",
+        "files": [
+          {
+            "path": "src/constants.py",
+            "content": "def constant_value() -> int:\n    return int('2')\n"
+          }
+        ]
+      },
+      "head_snapshot": {
+        "commit_sha": "0000000000000000000000000000000000000082",
+        "files": [
+          {
+            "path": "src/constants.py",
+            "content": "def constant_value() -> int:\n    return eval('2')\n"
+          }
+        ]
+      },
+      "changed_files": [
+        {
+          "path": "src/constants.py",
+          "status": "modified",
+          "additions": 1,
+          "deletions": 1,
+          "patch": "@@ -1,2 +1,2 @@\n def constant_value() -> int:\n-    return int('2')\n+    return eval('2')\n"
+        }
+      ],
+      "expected_findings": [],
+      "recommended_test_scenarios": [
+        "Verify the function returns the constant value.",
+        "Keep the source expression fixed and do not generalize this label to eval calls receiving external input."
+      ],
+      "analysis_limitations": [
+        "The source string is a fixed literal in this snapshot; an expanded data flow or a future change could alter the trust boundary.",
+        "The empty label is scoped to this fixed expression and does not claim that every use of eval is safe."
+      ]
+    },
+    {
+      "case_id": "ordinary-string-normalization",
+      "category": "negative",
+      "case_type": "negative",
+      "description": "A small helper normalizes a caller-provided string using its standard strip method.",
+      "pull_request": {
+        "title": "Normalize names",
+        "description": "Adds whitespace normalization before a name is stored."
+      },
+      "base_snapshot": {
+        "commit_sha": "0000000000000000000000000000000000000091",
+        "files": [
+          {
+            "path": "src/names.py",
+            "content": "def normalize_name(value: str) -> str:\n    return value\n"
+          }
+        ]
+      },
+      "head_snapshot": {
+        "commit_sha": "0000000000000000000000000000000000000092",
+        "files": [
+          {
+            "path": "src/names.py",
+            "content": "def normalize_name(value: str) -> str:\n    return value.strip()\n"
+          }
+        ]
+      },
+      "changed_files": [
+        {
+          "path": "src/names.py",
+          "status": "modified",
+          "additions": 1,
+          "deletions": 1,
+          "patch": "@@ -1,2 +1,2 @@\n def normalize_name(value: str) -> str:\n-    return value\n+    return value.strip()\n"
+        }
+      ],
+      "expected_findings": [],
+      "recommended_test_scenarios": [
+        "Verify leading and trailing whitespace is removed.",
+        "Verify an empty string remains empty."
+      ],
+      "analysis_limitations": [
+        "The case labels only the supplied string-normalization change and does not assess downstream validation or storage."
+      ]
+    }
+  ]
+}
