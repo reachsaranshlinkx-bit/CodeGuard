@@ -5,6 +5,9 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
+from codeguard.ai.execution_coordinator import AIExecutionCoordinator
+from codeguard.ai.factory import create_ai_review_provider_selection
+from codeguard.ai.operation_repository import AIOperationRepository
 from codeguard.api.v1.health import router as health_router
 from codeguard.api.v1.reviews import router as reviews_router
 from codeguard.api.v1.webhooks import router as webhooks_router
@@ -21,6 +24,7 @@ from codeguard.services.webhook_review_processor import (
 )
 from codeguard.webhooks.delivery_store import WebhookDeliveryStore
 from codeguard.webhooks.job_queue import WebhookJobQueue
+from codeguard.webhooks.schema_migrations import migrate_webhook_database
 
 logger = logging.getLogger(__name__)
 
@@ -77,11 +81,22 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         stop_event = asyncio.Event()
 
         try:
+            provider_selection = create_ai_review_provider_selection(app_settings)
+            ai_execution_coordinator = (
+                AIExecutionCoordinator(
+                    provider_selection=provider_selection,
+                    repository=app.state.ai_operation_repository,
+                )
+                if provider_selection is not None
+                else None
+            )
+
             analyzer = PullRequestAnalyzer(
                 github_client=github_client,
                 repository_context_builder=RepositoryContextBuilder(
                     github_client,
                 ),
+                ai_execution_coordinator=ai_execution_coordinator,
             )
 
             processor = WebhookReviewProcessor(
@@ -129,6 +144,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         description=app_settings.app_description,
         debug=app_settings.debug,
         lifespan=lifespan,
+    )
+
+    migrate_webhook_database(app_settings.webhook_database_path)
+
+    app.state.ai_operation_repository = AIOperationRepository(
+        database_path=app_settings.webhook_database_path,
     )
 
     app.state.webhook_delivery_store = WebhookDeliveryStore(

@@ -3,7 +3,22 @@ import pytest
 from codeguard.ai.context_builder import AIReviewContextBuilder
 from codeguard.ai.contracts import AIReviewInput, AIReviewResult
 from codeguard.ai.engine import AIReviewEngine, AIReviewExecutionResult
+from codeguard.ai.execution_coordinator import (
+    AIExecutionInProgressError,
+    AIExecutionInvalidStoredResultError,
+    AIExecutionLeaseLostError,
+    AIExecutionOutcome,
+    AIExecutionOutcomeUnknownError,
+    AIExecutionPermanentFailureError,
+    AIExecutionPersistenceError,
+    AIExecutionRetryableError,
+)
 from codeguard.ai.mock_provider import MockAIReviewProvider
+from codeguard.ai.operation_identity import LegacyAIOperationIdentity
+from codeguard.ai.operation_repository import (
+    AIOperationRecord,
+    AIOperationStatus,
+)
 from codeguard.analyzers.python_ast import (
     PythonAnalysisResult,
     PythonASTAnalyzer,
@@ -200,6 +215,38 @@ class RecordingAIReviewEngine(AIReviewEngine):
         result = await super().review(review_input, source_snapshot)
         self.execution_results.append(result)
         return result
+
+
+class RecordingAIExecutionCoordinator:
+    """Capture the validated inputs passed to durable execution."""
+
+    def __init__(
+        self,
+        outcome: AIExecutionOutcome | None = None,
+        error: Exception | None = None,
+    ) -> None:
+        self.outcome = outcome
+        self.error = error
+        self.execute_calls: list[
+            tuple[AIReviewInput, RepositorySourceSnapshot, str]
+        ] = []
+
+    async def execute(
+        self,
+        review_input: AIReviewInput,
+        source_snapshot: RepositorySourceSnapshot,
+        *,
+        base_sha: str,
+    ) -> AIExecutionOutcome:
+        self.execute_calls.append((review_input, source_snapshot, base_sha))
+
+        if self.error is not None:
+            raise self.error
+
+        if self.outcome is None:
+            raise AssertionError("A coordinator outcome must be configured.")
+
+        return self.outcome
 
 
 def make_repository_context_build_result(
@@ -1515,3 +1562,163 @@ async def test_analyzer_propagates_ai_provider_exceptions() -> None:
         await analyzer.analyze("octocat", "CodeGuard", 42)
 
     assert len(provider.reviewed_inputs) == 1
+
+
+@pytest.mark.parametrize("reused", [False, True], ids=["fresh", "cached"])
+@pytest.mark.asyncio
+async def test_analyzer_uses_coordinator_and_unwraps_execution_result(
+    reused: bool,
+) -> None:
+    repository_context = make_ai_integration_context()
+    context_builder = FakeSnapshotAwareRepositoryContextBuilder(repository_context)
+    execution_result = AIReviewExecutionResult(
+        provider_result=AIReviewResult(
+            summary="Durable mock review completed.",
+        ),
+        assessments=(),
+    )
+    coordinator = RecordingAIExecutionCoordinator(
+        outcome=AIExecutionOutcome(
+            operation_key="ai-operation-v2:test",
+            execution_result=execution_result,
+            reused=reused,
+        )
+    )
+    analyzer = PullRequestAnalyzer(
+        github_client=make_ai_integration_client(),
+        repository_context_builder=context_builder,
+        ai_execution_coordinator=coordinator,  # type: ignore[arg-type]
+    )
+
+    result = await analyzer.analyze("octocat", "CodeGuard", 42)
+
+    assert context_builder.build_calls == []
+    assert context_builder.build_with_source_calls == [
+        ("octocat", "CodeGuard", "b" * 40),
+    ]
+    assert len(coordinator.execute_calls) == 1
+
+    review_input, source_snapshot, base_sha = coordinator.execute_calls[0]
+    expected_context = AIReviewContextBuilder().build(
+        changed_file_paths=("src/auth.py",),
+        related_file_paths=("src/views.py",),
+        source_snapshot=repository_context.source_snapshot,
+    )
+    expected_input = AIReviewInput(
+        owner="octocat",
+        repo="CodeGuard",
+        pull_number=42,
+        head_sha="b" * 40,
+        context=expected_context,
+    )
+
+    assert isinstance(review_input, AIReviewInput)
+    assert review_input == expected_input
+    assert source_snapshot is repository_context.source_snapshot
+    assert base_sha == "a" * 40
+    assert result.ai_review_result is execution_result
+    assert isinstance(result.ai_review_result, AIReviewExecutionResult)
+
+
+def _make_permanent_execution_error() -> AIExecutionPermanentFailureError:
+    identity = LegacyAIOperationIdentity(
+        owner="octocat",
+        repo="CodeGuard",
+        pull_number=42,
+        head_sha="b" * 40,
+        provider_identity="mock",
+        model_identity="mock-profile",
+        prompt_contract_version="prompt-v1",
+        context_contract_version="context-v1",
+        evidence_contract_version="evidence-v1",
+        review_contract_version="review-v1",
+    )
+    record = AIOperationRecord(
+        operation_key="ai-operation-v1:test",
+        identity=identity,
+        status=AIOperationStatus.FAILED_PERMANENT,
+        lease_expires_at=None,
+        provider_request_started_at=None,
+        result_schema_version=None,
+        serialization_version=None,
+        result_json=None,
+        provider_request_id=None,
+        disposition="PERMANENT",
+        safe_error="AIProviderConfigurationError",
+        created_at="",
+        updated_at="",
+    )
+    return AIExecutionPermanentFailureError(record)
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        AIExecutionInProgressError("operation", "in progress"),
+        AIExecutionRetryableError("operation", "retryable"),
+        _make_permanent_execution_error(),
+        AIExecutionOutcomeUnknownError("operation", "unknown"),
+        AIExecutionLeaseLostError("operation", "lease lost"),
+        AIExecutionPersistenceError("operation", "persistence failed"),
+        AIExecutionInvalidStoredResultError("operation", "invalid stored result"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_analyzer_propagates_coordinator_errors_unchanged(
+    error: Exception,
+) -> None:
+    coordinator = RecordingAIExecutionCoordinator(error=error)
+    analyzer = PullRequestAnalyzer(
+        github_client=make_ai_integration_client(),
+        repository_context_builder=FakeSnapshotAwareRepositoryContextBuilder(
+            make_ai_integration_context()
+        ),
+        ai_execution_coordinator=coordinator,  # type: ignore[arg-type]
+    )
+
+    with pytest.raises(type(error)) as raised:
+        await analyzer.analyze("octocat", "CodeGuard", 42)
+
+    assert raised.value is error
+    assert len(coordinator.execute_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_legacy_engine_remains_compatible_in_its_original_positional_slot() -> (
+    None
+):
+    repository_context = make_ai_integration_context()
+    context_builder = FakeSnapshotAwareRepositoryContextBuilder(repository_context)
+    provider = MockAIReviewProvider(
+        result=AIReviewResult(summary="Legacy mock review completed.")
+    )
+    engine = RecordingAIReviewEngine(provider)
+
+    analyzer = PullRequestAnalyzer(
+        make_ai_integration_client(),
+        None,
+        None,
+        context_builder,
+        engine,
+        AIReviewContextBuilder(),
+    )
+
+    result = await analyzer.analyze("octocat", "CodeGuard", 42)
+
+    assert context_builder.build_with_source_calls == [
+        ("octocat", "CodeGuard", "b" * 40),
+    ]
+    assert len(engine.review_calls) == 1
+    assert result.ai_review_result is engine.execution_results[0]
+
+
+def test_analyzer_rejects_simultaneous_engine_and_coordinator_injection() -> None:
+    with pytest.raises(
+        ValueError,
+        match="ai_review_engine and ai_execution_coordinator cannot both be set",
+    ):
+        PullRequestAnalyzer(
+            github_client=make_ai_integration_client(),
+            ai_review_engine=RecordingAIReviewEngine(MockAIReviewProvider()),
+            ai_execution_coordinator=RecordingAIExecutionCoordinator(),  # type: ignore[arg-type]
+        )

@@ -4,7 +4,8 @@ from pydantic import ValidationError
 from codeguard.core.config import Settings
 
 
-def test_settings_use_expected_defaults() -> None:
+def test_settings_use_expected_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("CODEGUARD_AI_PROVIDER", raising=False)
     settings = Settings(_env_file=None)
 
     assert settings.app_name == "CodeGuard API"
@@ -12,6 +13,58 @@ def test_settings_use_expected_defaults() -> None:
     assert settings.environment == "development"
     assert settings.debug is False
     assert settings.log_level == "INFO"
+    assert settings.ai_provider == "disabled"
+
+
+@pytest.mark.parametrize("provider", ["disabled", "mock"])
+def test_ai_provider_is_loaded_from_environment(
+    monkeypatch: pytest.MonkeyPatch,
+    provider: str,
+) -> None:
+    monkeypatch.setenv("CODEGUARD_ENVIRONMENT", "development")
+    monkeypatch.setenv("CODEGUARD_AI_PROVIDER", provider)
+
+    settings = Settings(_env_file=None)
+
+    assert settings.ai_provider == provider
+
+
+def test_ai_provider_rejects_unsupported_environment_value(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CODEGUARD_AI_PROVIDER", "openai")
+
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None)
+
+
+@pytest.mark.parametrize("environment", ["development", "testing"])
+def test_mock_ai_provider_is_allowed_in_nonproduction_environments(
+    environment: str,
+) -> None:
+    settings = Settings(
+        _env_file=None,
+        environment=environment,
+        ai_provider="mock",
+    )
+
+    assert settings.ai_provider == "mock"
+
+
+@pytest.mark.parametrize("environment", ["staging", "production"])
+def test_mock_ai_provider_is_rejected_outside_development_and_testing(
+    environment: str,
+) -> None:
+    with pytest.raises(ValidationError, match="mock"):
+        Settings(
+            _env_file=None,
+            environment=environment,
+            ai_provider="mock",
+            debug=False,
+            api_key="test-codeguard-api-key",
+            github_token="test-github-token",
+            github_webhook_secret="test-webhook-secret",
+        )
 
 
 def test_settings_read_environment_variables(
@@ -70,6 +123,19 @@ def test_api_key_is_loaded_as_secret(monkeypatch) -> None:
     assert settings.api_key.get_secret_value() == "test-codeguard-api-key"
     assert str(settings.api_key) == "**********"
     assert "test-codeguard-api-key" not in repr(settings)
+
+
+def test_codeguard_api_key_does_not_select_ai_provider(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("CODEGUARD_AI_PROVIDER", raising=False)
+    monkeypatch.setenv("CODEGUARD_API_KEY", "test-codeguard-api-key")
+
+    settings = Settings(_env_file=None)
+
+    assert settings.ai_provider == "disabled"
+    assert settings.api_key is not None
+    assert settings.api_key.get_secret_value() == "test-codeguard-api-key"
 
 
 def test_production_requires_api_key(monkeypatch) -> None:

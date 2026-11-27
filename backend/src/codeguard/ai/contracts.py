@@ -11,6 +11,10 @@ from pydantic import (
 AISeverity = Literal["critical", "high", "medium", "low", "info"]
 AIConfidence = Literal["low", "medium", "high"]
 
+# Increment when validated review input/result semantics change. Codec-only
+# serialization changes do not change this contract version.
+REVIEW_CONTRACT_VERSION = "review-v1"
+
 
 class AIReviewInput(BaseModel):
     """

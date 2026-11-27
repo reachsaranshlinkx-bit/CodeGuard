@@ -7,6 +7,7 @@ from typing import Protocol
 from codeguard.ai.context_builder import AIReviewContextBuilder
 from codeguard.ai.contracts import AIReviewInput
 from codeguard.ai.engine import AIReviewEngine, AIReviewExecutionResult
+from codeguard.ai.execution_coordinator import AIExecutionCoordinator
 from codeguard.analyzers.python_ast import (
     ClassInfo,
     FunctionInfo,
@@ -130,12 +131,19 @@ class PullRequestAnalyzer:
         repository_context_builder: RepositoryContextBuilderProtocol | None = None,
         ai_review_engine: AIReviewEngine | None = None,
         ai_review_context_builder: AIReviewContextBuilder | None = None,
+        ai_execution_coordinator: AIExecutionCoordinator | None = None,
     ) -> None:
+        if ai_review_engine is not None and ai_execution_coordinator is not None:
+            raise ValueError(
+                "ai_review_engine and ai_execution_coordinator cannot both be set."
+            )
+
         self._github_client = github_client
         self._ast_analyzer = ast_analyzer or PythonASTAnalyzer()
         self._risk_analyzer = risk_analyzer or PythonRiskAnalyzer()
         self._repository_context_builder = repository_context_builder
         self._ai_review_engine = ai_review_engine
+        self._ai_execution_coordinator = ai_execution_coordinator
         self._ai_review_context_builder = (
             ai_review_context_builder
             if ai_review_context_builder is not None
@@ -181,9 +189,13 @@ class PullRequestAnalyzer:
         )
         repository_context = None
         source_snapshot = None
+        ai_execution_configured = (
+            self._ai_execution_coordinator is not None
+            or self._ai_review_engine is not None
+        )
 
         if self._repository_context_builder is not None:
-            if self._ai_review_engine is None:
+            if not ai_execution_configured:
                 repository_context = await self._repository_context_builder.build(
                     owner=owner,
                     repo=repo,
@@ -216,7 +228,7 @@ class PullRequestAnalyzer:
 
                 repository_context = context_result.symbol_index
                 source_snapshot = context_result.source_snapshot
-        elif self._ai_review_engine is not None:
+        elif ai_execution_configured:
             raise TypeError(
                 "AI review requires a repository context builder with "
                 "a build_with_source() method."
@@ -237,7 +249,7 @@ class PullRequestAnalyzer:
 
         ai_review_result = None
 
-        if self._ai_review_engine is not None:
+        if ai_execution_configured:
             if source_snapshot is None:
                 raise RuntimeError(
                     "AI review cannot proceed without a repository source snapshot."
@@ -268,10 +280,18 @@ class PullRequestAnalyzer:
                     head_sha=pull_request.head.sha,
                     context=context,
                 )
-                ai_review_result = await self._ai_review_engine.review(
-                    review_input,
-                    source_snapshot,
-                )
+                if self._ai_execution_coordinator is not None:
+                    outcome = await self._ai_execution_coordinator.execute(
+                        review_input,
+                        source_snapshot,
+                        base_sha=pull_request.base.sha,
+                    )
+                    ai_review_result = outcome.execution_result
+                elif self._ai_review_engine is not None:
+                    ai_review_result = await self._ai_review_engine.review(
+                        review_input,
+                        source_snapshot,
+                    )
 
         return PullRequestAnalysisResult(
             owner=owner,
