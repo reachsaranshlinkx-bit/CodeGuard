@@ -4,9 +4,12 @@ import time
 from pathlib import Path
 from threading import Event
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
+from pydantic import SecretStr
 
+import codeguard.ai.factory as ai_factory
 import codeguard.main as main
 from codeguard.ai.exceptions import AIProviderConfigurationError
 from codeguard.ai.execution_coordinator import AIExecutionCoordinator
@@ -15,6 +18,7 @@ from codeguard.ai.factory import (
     create_ai_review_provider_selection,
 )
 from codeguard.ai.mock_provider import MockAIReviewProvider
+from codeguard.ai.openai_provider import OpenAIReviewProvider
 from codeguard.ai.operation_repository import AIOperationRepository
 from codeguard.context.repository_context_builder import (
     RepositoryContextBuilder,
@@ -254,6 +258,103 @@ def test_selected_provider_client_is_closed_during_lifespan_shutdown(
     assert selected_providers[0].closed is True
     assert len(created_clients) == 1
     assert created_clients[0].closed is True
+
+
+def test_openai_provider_is_selected_injected_and_closed_during_lifespan(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    created_clients: list[FakeGitHubClient] = []
+    created_providers: list[OpenAIReviewProvider] = []
+    analyzers = []
+    worker_started = Event()
+    provider_requests: list[httpx.Request] = []
+
+    def fake_client_factory(token: str | None = None) -> FakeGitHubClient:
+        client = FakeGitHubClient(token=token)
+        created_clients.append(client)
+        return client
+
+    def provider_transport(request: httpx.Request) -> httpx.Response:
+        provider_requests.append(request)
+        return httpx.Response(200, json={}, request=request)
+
+    class MockTransportOpenAIReviewProvider(OpenAIReviewProvider):
+        def __init__(
+            self,
+            *,
+            model_identity: str,
+            api_key: SecretStr | str,
+        ) -> None:
+            super().__init__(
+                model_identity=model_identity,
+                api_key=api_key,
+                transport=httpx.MockTransport(provider_transport),
+            )
+            created_providers.append(self)
+
+    class CapturingReviewProcessor:
+        def __init__(
+            self,
+            *,
+            analyzer,
+            github_client,
+            publishing_enabled: bool,
+        ) -> None:
+            analyzers.append(analyzer)
+
+    async def fake_worker_loop(
+        *,
+        worker,
+        poll_interval_seconds: int,
+        stop_event,
+    ) -> None:
+        worker_started.set()
+        await stop_event.wait()
+
+    monkeypatch.setattr(main, "GitHubClient", fake_client_factory)
+    monkeypatch.setattr(
+        main,
+        "WebhookReviewProcessor",
+        CapturingReviewProcessor,
+    )
+    monkeypatch.setattr(main, "run_webhook_worker", fake_worker_loop)
+    monkeypatch.setattr(
+        ai_factory,
+        "OpenAIReviewProvider",
+        MockTransportOpenAIReviewProvider,
+    )
+
+    settings = Settings(
+        _env_file=None,
+        environment="testing",
+        ai_provider="openai",
+        openai_api_key="test-openai-key-not-a-real-credential",
+        openai_model="gpt-test-model",
+        webhook_worker_enabled=True,
+        webhook_database_path=tmp_path / "openai-provider-lifecycle.sqlite3",
+    )
+    app = main.create_app(settings=settings)
+
+    with TestClient(app):
+        assert worker_started.wait(timeout=2)
+        assert len(created_providers) == 1
+        assert len(analyzers) == 1
+
+        coordinator = analyzers[0]._ai_execution_coordinator
+        assert isinstance(coordinator, AIExecutionCoordinator)
+        assert coordinator._provider_selection.provider is created_providers[0]
+        assert coordinator._provider_selection.metadata.provider_identity == "openai"
+        assert (
+            coordinator._provider_selection.metadata.model_identity == "gpt-test-model"
+        )
+        assert created_providers[0]._client._client.is_closed is False
+        assert provider_requests == []
+
+    assert created_providers[0]._client._client.is_closed is True
+    assert len(created_clients) == 1
+    assert created_clients[0].closed is True
+    assert provider_requests == []
 
 
 def test_enabled_worker_starts_and_shuts_down_cleanly(
