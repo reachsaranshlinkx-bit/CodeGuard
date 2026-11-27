@@ -6,6 +6,7 @@ from codeguard.ai.factory import (
     create_ai_review_provider_selection,
 )
 from codeguard.ai.mock_provider import MockAIReviewProvider
+from codeguard.ai.openai_provider import OpenAIReviewProvider
 from codeguard.core.config import Settings
 
 
@@ -56,7 +57,7 @@ def test_factory_rejects_incompatible_settings(
         create_ai_review_provider(settings)
 
 
-def test_openai_factory_fails_closed_until_request_adapter_exists() -> None:
+def test_openai_factory_selects_configured_provider_without_network_access() -> None:
     settings = Settings(
         _env_file=None,
         environment="testing",
@@ -65,10 +66,11 @@ def test_openai_factory_fails_closed_until_request_adapter_exists() -> None:
         openai_model="gpt-test-model",
     )
 
-    with pytest.raises(
-        AIProviderConfigurationError,
-        match="request adapter is implemented",
-    ) as exc_info:
-        create_ai_review_provider_selection(settings)
+    selection = create_ai_review_provider_selection(settings)
 
-    assert "test-openai-secret" not in str(exc_info.value)
+    assert selection is not None
+    assert isinstance(selection.provider, OpenAIReviewProvider)
+    assert selection.metadata == selection.provider.execution_metadata
+    assert selection.metadata.provider_identity == "openai"
+    assert selection.metadata.model_identity == "gpt-test-model"
+    assert "test-openai-secret" not in repr(selection.provider)
