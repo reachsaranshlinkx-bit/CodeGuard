@@ -18,6 +18,10 @@ from codeguard.evaluation.metrics import (
     calculate_evaluation_metrics,
 )
 
+METRIC_DEFINITIONS_VERSION = "codeguard-eval-metrics-v1"
+# M3.5.4 reports used these formulas before the version field was introduced.
+LEGACY_METRIC_DEFINITIONS_VERSION = "codeguard-eval-metrics-v1"
+
 
 class _ReportModel(BaseModel):
     model_config = ConfigDict(
@@ -40,6 +44,10 @@ class EvaluationReport(_ReportModel):
     evaluation_run_id: CaseIdentifier
     dataset_id: CaseIdentifier
     dataset_version: Annotated[str, Field(pattern=r"^\d+\.\d+\.\d+$")]
+    metric_definitions_version: NonBlankText = Field(
+        default=LEGACY_METRIC_DEFINITIONS_VERSION,
+        max_length=100,
+    )
     system_name: NonBlankText
     system_version: NonBlankText
     started_at: datetime
@@ -58,10 +66,23 @@ class EvaluationReport(_ReportModel):
                 "Report dataset version must match its metrics dataset version."
             )
         metric_case_ids = tuple(case.case_id for case in self.metrics.per_case)
+        recommendation_case_ids = tuple(
+            case.case_id for case in self.metrics.test_recommendation_metrics.per_case
+        )
         limitation_case_ids = tuple(case.case_id for case in self.case_limitations)
-        if metric_case_ids != limitation_case_ids:
+        if self.metrics.evaluated_case_count != len(
+            metric_case_ids
+        ) or self.metrics.test_recommendation_metrics.evaluated_case_count != len(
+            recommendation_case_ids
+        ):
+            raise ValueError("Report evaluated case counts must match case details.")
+        if (
+            metric_case_ids != recommendation_case_ids
+            or metric_case_ids != limitation_case_ids
+        ):
             raise ValueError(
-                "Report limitations must cover cases in the same order as metrics."
+                "Report finding, recommendation, and limitation cases must have "
+                "the same order."
             )
         return self
 
@@ -74,6 +95,7 @@ def build_evaluation_report(run: EvaluationRun) -> EvaluationReport:
         evaluation_run_id=run.run_id,
         dataset_id=run.dataset.dataset_id,
         dataset_version=run.dataset.dataset_version,
+        metric_definitions_version=METRIC_DEFINITIONS_VERSION,
         system_name=run.system_name,
         system_version=run.system_version,
         started_at=run.started_at,
@@ -110,6 +132,7 @@ def render_markdown_report(report: EvaluationReport) -> str:
         f"| Evaluation run | {_markdown(report.evaluation_run_id)} |",
         f"| Dataset | {_markdown(report.dataset_id)} "
         f"v{_markdown(report.dataset_version)} |",
+        f"| Metric definitions | {_markdown(report.metric_definitions_version)} |",
         f"| System | {_markdown(report.system_name)} |",
         f"| System version | {_markdown(report.system_version)} |",
         f"| Run timestamp | {_markdown(report.started_at.isoformat())} |",
