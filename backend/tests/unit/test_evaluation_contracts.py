@@ -12,6 +12,7 @@ from codeguard.evaluation.contracts import (
     EvaluationDataset,
     EvaluationResult,
     EvaluationRun,
+    FindingMatch,
     load_evaluation_dataset,
 )
 
@@ -23,6 +24,18 @@ def dataset_payload() -> dict[str, Any]:
 
 def validate_dataset_payload(payload: dict[str, Any]) -> EvaluationDataset:
     return EvaluationDataset.model_validate_json(json.dumps(payload))
+
+
+def results_for_all_cases(
+    dataset: EvaluationDataset,
+    result: EvaluationResult,
+) -> tuple[EvaluationResult, ...]:
+    return tuple(
+        result
+        if case.case_id == result.case_id
+        else EvaluationResult(case_id=case.case_id, predicted_findings=())
+        for case in dataset.cases
+    )
 
 
 def test_packaged_golden_dataset_loads_with_expected_scope_and_categories() -> None:
@@ -172,7 +185,12 @@ def test_evaluation_run_validates_case_and_ground_truth_references() -> None:
     result = EvaluationResult(
         case_id=positive_case.case_id,
         predicted_findings=(expected.finding,),
-        matched_ground_truth_ids=(expected.finding_id,),
+        finding_matches=(
+            FindingMatch(
+                predicted_finding_index=0,
+                ground_truth_finding_id=expected.finding_id,
+            ),
+        ),
     )
     run = EvaluationRun(
         run_id="manual-evaluation-001",
@@ -180,13 +198,22 @@ def test_evaluation_run_validates_case_and_ground_truth_references() -> None:
         started_at=datetime(2026, 11, 27, tzinfo=UTC),
         system_name="synthetic-test-system",
         system_version="0.1.0",
-        results=(result,),
+        results=results_for_all_cases(dataset, result),
     )
 
-    assert run.results[0].matched_ground_truth_ids == ("dynamic-execution",)
+    assert run.results[0].finding_matches[0].ground_truth_finding_id == (
+        "dynamic-execution"
+    )
 
-    invalid_result = result.model_copy(
-        update={"matched_ground_truth_ids": ("missing-ground-truth",)}
+    invalid_result = EvaluationResult(
+        case_id=positive_case.case_id,
+        predicted_findings=(expected.finding,),
+        finding_matches=(
+            FindingMatch(
+                predicted_finding_index=0,
+                ground_truth_finding_id="missing-ground-truth",
+            ),
+        ),
     )
     with pytest.raises(ValidationError, match="unknown ground-truth finding"):
         EvaluationRun(
@@ -195,7 +222,7 @@ def test_evaluation_run_validates_case_and_ground_truth_references() -> None:
             started_at=datetime(2026, 11, 27, tzinfo=UTC),
             system_name="synthetic-test-system",
             system_version="0.1.0",
-            results=(invalid_result,),
+            results=results_for_all_cases(dataset, invalid_result),
         )
 
 
@@ -214,7 +241,7 @@ def test_evaluation_run_rejects_unknown_case_ids() -> None:
         )
 
 
-def test_evaluation_run_rejects_negative_false_positive_indexes() -> None:
+def test_evaluation_run_rejects_out_of_range_prediction_match_indexes() -> None:
     dataset = load_evaluation_dataset()
     case = dataset.cases[0]
     prediction = case.expected_findings[0].finding
@@ -222,12 +249,17 @@ def test_evaluation_run_rejects_negative_false_positive_indexes() -> None:
     result = EvaluationResult(
         case_id=case.case_id,
         predicted_findings=(prediction,),
-        false_positive_finding_indexes=(-1,),
+        finding_matches=(
+            FindingMatch(
+                predicted_finding_index=1,
+                ground_truth_finding_id=case.expected_findings[0].finding_id,
+            ),
+        ),
     )
 
     with pytest.raises(
         ValidationError,
-        match="False-positive indexes must reference a predicted finding",
+        match="Finding match indexes must reference a predicted finding",
     ):
         EvaluationRun(
             run_id="manual-evaluation-negative-index",
@@ -235,5 +267,6 @@ def test_evaluation_run_rejects_negative_false_positive_indexes() -> None:
             started_at=datetime(2026, 11, 27, tzinfo=UTC),
             system_name="synthetic-test-system",
             system_version="0.1.0",
+            is_complete=False,
             results=(result,),
         )
