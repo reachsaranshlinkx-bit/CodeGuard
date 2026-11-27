@@ -56,6 +56,14 @@ def make_result(summary: str) -> AIReviewResult:
     return AIReviewResult(summary=summary, findings=())
 
 
+class GenericTestProvider:
+    def __init__(self, execution_metadata: AIExecutionMetadata) -> None:
+        self.execution_metadata = execution_metadata
+
+    async def review(self, review_input: AIReviewInput) -> AIReviewResult:
+        return make_result("Generic provider test result.")
+
+
 def test_metadata_descriptor_has_exact_fields_and_identity_conversion() -> None:
     metadata = make_metadata()
     expected_fields = (
@@ -233,6 +241,96 @@ def test_provider_selection_rejects_divergent_metadata() -> None:
             provider=selection.provider,
             metadata=mismatched_versions,
         )
+
+
+def test_provider_selection_accepts_non_mock_provider_identity() -> None:
+    provider_metadata = AIExecutionMetadata(
+        provider_identity="openai",
+        model_identity="gpt-test-model",
+        prompt_contract_version="openai-prompt-v1",
+        context_contract_version=CONTEXT_CONTRACT_VERSION,
+        evidence_contract_version=EVIDENCE_CONTRACT_VERSION,
+        review_contract_version=REVIEW_CONTRACT_VERSION,
+    )
+    provider = GenericTestProvider(provider_metadata)
+
+    selection = AIReviewProviderSelection(
+        provider=provider,
+        metadata=provider_metadata,
+    )
+
+    assert selection.provider is provider
+    assert selection.metadata.provider_identity == "openai"
+    assert selection.metadata.model_identity == "gpt-test-model"
+
+
+def test_provider_selection_rejects_generic_provider_model_mismatch() -> None:
+    provider_metadata = AIExecutionMetadata(
+        provider_identity="openai",
+        model_identity="gpt-test-model",
+        prompt_contract_version="openai-prompt-v1",
+        context_contract_version=CONTEXT_CONTRACT_VERSION,
+        evidence_contract_version=EVIDENCE_CONTRACT_VERSION,
+        review_contract_version=REVIEW_CONTRACT_VERSION,
+    )
+    provider = GenericTestProvider(provider_metadata)
+    mismatched_metadata = AIExecutionMetadata(
+        provider_identity="openai",
+        model_identity="gpt-other-model",
+        prompt_contract_version="openai-prompt-v1",
+        context_contract_version=CONTEXT_CONTRACT_VERSION,
+        evidence_contract_version=EVIDENCE_CONTRACT_VERSION,
+        review_contract_version=REVIEW_CONTRACT_VERSION,
+    )
+
+    with pytest.raises(AIProviderConfigurationError, match="does not match"):
+        AIReviewProviderSelection(
+            provider=provider,
+            metadata=mismatched_metadata,
+        )
+
+
+def test_provider_selection_rejects_generic_provider_identity_mismatch() -> None:
+    provider_metadata = AIExecutionMetadata(
+        provider_identity="openai",
+        model_identity="gpt-test-model",
+        prompt_contract_version="openai-prompt-v1",
+        context_contract_version=CONTEXT_CONTRACT_VERSION,
+        evidence_contract_version=EVIDENCE_CONTRACT_VERSION,
+        review_contract_version=REVIEW_CONTRACT_VERSION,
+    )
+    provider = GenericTestProvider(provider_metadata)
+    mismatched_metadata = AIExecutionMetadata(
+        provider_identity="other-provider",
+        model_identity="gpt-test-model",
+        prompt_contract_version="openai-prompt-v1",
+        context_contract_version=CONTEXT_CONTRACT_VERSION,
+        evidence_contract_version=EVIDENCE_CONTRACT_VERSION,
+        review_contract_version=REVIEW_CONTRACT_VERSION,
+    )
+
+    with pytest.raises(AIProviderConfigurationError, match="does not match"):
+        AIReviewProviderSelection(
+            provider=provider,
+            metadata=mismatched_metadata,
+        )
+
+
+@pytest.mark.asyncio
+async def test_provider_selection_closes_optional_provider_client() -> None:
+    class ClosableTestProvider(GenericTestProvider):
+        closed = False
+
+        async def aclose(self) -> None:
+            self.closed = True
+
+    metadata = make_metadata()
+    provider = ClosableTestProvider(metadata)
+    selection = AIReviewProviderSelection(provider=provider, metadata=metadata)
+
+    await selection.aclose()
+
+    assert provider.closed is True
 
 
 def test_existing_provider_factory_interface_remains_compatible() -> None:

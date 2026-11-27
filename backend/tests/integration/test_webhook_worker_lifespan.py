@@ -10,7 +10,10 @@ from fastapi.testclient import TestClient
 import codeguard.main as main
 from codeguard.ai.exceptions import AIProviderConfigurationError
 from codeguard.ai.execution_coordinator import AIExecutionCoordinator
-from codeguard.ai.factory import create_ai_review_provider_selection
+from codeguard.ai.factory import (
+    AIReviewProviderSelection,
+    create_ai_review_provider_selection,
+)
 from codeguard.ai.mock_provider import MockAIReviewProvider
 from codeguard.ai.operation_repository import AIOperationRepository
 from codeguard.context.repository_context_builder import (
@@ -25,6 +28,15 @@ class FakeGitHubClient:
 
     def __init__(self, token: str | None = None) -> None:
         self.token = token
+        self.closed = False
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+class ClosableMockAIReviewProvider(MockAIReviewProvider):
+    def __init__(self, *, profile_identity: str) -> None:
+        super().__init__(profile_identity=profile_identity)
         self.closed = False
 
     async def aclose(self) -> None:
@@ -175,6 +187,71 @@ def test_mock_provider_is_injected_into_analyzer(
         with sqlite3.connect(settings.webhook_database_path) as connection:
             assert connection.execute("PRAGMA user_version").fetchone() == (3,)
 
+    assert len(created_clients) == 1
+    assert created_clients[0].closed is True
+
+
+def test_selected_provider_client_is_closed_during_lifespan_shutdown(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    created_clients: list[FakeGitHubClient] = []
+    selected_providers: list[ClosableMockAIReviewProvider] = []
+    worker_started = Event()
+    original_selection_factory = main.create_ai_review_provider_selection
+
+    def fake_client_factory(token: str | None = None) -> FakeGitHubClient:
+        client = FakeGitHubClient(token=token)
+        created_clients.append(client)
+        return client
+
+    def provider_selection_factory(settings: Settings):
+        baseline = original_selection_factory(settings)
+        assert baseline is not None
+        profile_identity = baseline.metadata.model_identity
+        provider = ClosableMockAIReviewProvider(
+            profile_identity=profile_identity,
+        )
+        selected_providers.append(provider)
+        return AIReviewProviderSelection(
+            provider=provider,
+            metadata=baseline.metadata,
+        )
+
+    async def fake_worker_loop(
+        *,
+        worker,
+        poll_interval_seconds: int,
+        stop_event,
+    ) -> None:
+        worker_started.set()
+        await stop_event.wait()
+
+    monkeypatch.setattr(main, "GitHubClient", fake_client_factory)
+    monkeypatch.setattr(
+        main,
+        "create_ai_review_provider_selection",
+        provider_selection_factory,
+    )
+    monkeypatch.setattr(main, "run_webhook_worker", fake_worker_loop)
+
+    app = main.create_app(
+        settings=Settings(
+            _env_file=None,
+            environment="testing",
+            ai_provider="mock",
+            webhook_worker_enabled=True,
+            webhook_database_path=tmp_path / "provider-lifecycle.sqlite3",
+        )
+    )
+
+    with TestClient(app):
+        assert worker_started.wait(timeout=2)
+        assert app.state.webhook_worker is not None
+        assert len(selected_providers) == 1
+        assert selected_providers[0].closed is False
+
+    assert selected_providers[0].closed is True
     assert len(created_clients) == 1
     assert created_clients[0].closed is True
 

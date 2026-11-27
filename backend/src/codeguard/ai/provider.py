@@ -1,6 +1,7 @@
-from typing import Protocol
+from typing import Protocol, runtime_checkable
 
 from codeguard.ai.contracts import AIReviewInput, AIReviewResult
+from codeguard.ai.execution_metadata import AIExecutionMetadata
 
 
 class AIReviewProvider(Protocol):
@@ -22,3 +23,17 @@ class AIReviewProvider(Protocol):
         Returned findings remain unverified until independently validated.
         """
         ...
+
+
+class AIReviewProviderExecutionIdentity(AIReviewProvider, Protocol):
+    """Durable execution identity declared by a concrete provider selection."""
+
+    @property
+    def execution_metadata(self) -> AIExecutionMetadata: ...
+
+
+@runtime_checkable
+class ClosableAIReviewProvider(Protocol):
+    """Optional lifecycle interface for providers that own external clients."""
+
+    async def aclose(self) -> None: ...
