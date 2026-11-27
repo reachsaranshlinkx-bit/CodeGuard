@@ -7,6 +7,7 @@ from codeguard.ai.mock_provider import (
     DEFAULT_MOCK_PROFILE_IDENTITY,
     MockAIReviewProvider,
 )
+from codeguard.ai.openai_provider import OpenAIReviewProvider
 from codeguard.ai.provider import (
     AIReviewProvider,
     AIReviewProviderExecutionIdentity,
@@ -92,7 +93,7 @@ def create_ai_review_provider_selection(
         )
 
         try:
-            provider = MockAIReviewProvider(
+            mock_provider = MockAIReviewProvider(
                 result=mock_result,
                 profile_identity=profile_identity,
             )
@@ -101,21 +102,30 @@ def create_ai_review_provider_selection(
                 "Mock profile identity must be a non-empty string."
             ) from None
 
-        if provider.profile_identity is None:
+        if mock_provider.profile_identity is None:
             raise AIProviderConfigurationError(
                 "Mock provider requires a stable profile identity for durable reuse."
             )
 
-        metadata = provider.execution_metadata
+        metadata = mock_provider.execution_metadata
         return AIReviewProviderSelection(
-            provider=provider,
+            provider=mock_provider,
             metadata=metadata,
         )
 
     if settings.ai_provider == "openai":
-        raise AIProviderConfigurationError(
-            "OpenAI provider selection is unavailable until its request adapter "
-            "is implemented."
+        if settings.openai_api_key is None or settings.openai_model is None:
+            raise AIProviderConfigurationError(
+                "OpenAI provider requires an API key and model identity."
+            )
+
+        openai_provider = OpenAIReviewProvider(
+            model_identity=settings.openai_model,
+            api_key=settings.openai_api_key,
+        )
+        return AIReviewProviderSelection(
+            provider=openai_provider,
+            metadata=openai_provider.execution_metadata,
         )
 
     raise AIProviderConfigurationError("Unsupported AI provider selection.")
