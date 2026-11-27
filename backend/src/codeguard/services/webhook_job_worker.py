@@ -8,6 +8,13 @@ from codeguard.ai.exceptions import (
     AIProviderFailureDisposition,
     classify_ai_provider_error,
 )
+from codeguard.ai.execution_coordinator import (
+    AIExecutionCoordinatorError,
+    AIExecutionInProgressError,
+    AIExecutionOutcomeUnknownError,
+    AIExecutionPermanentFailureError,
+    AIExecutionRetryableError,
+)
 from codeguard.services.webhook_review_processor import (
     WebhookReviewProcessor,
 )
@@ -127,6 +134,53 @@ class WebhookJobWorker:
                         )
 
                 return True
+            except (
+                AIExecutionRetryableError,
+                AIExecutionPermanentFailureError,
+                AIExecutionOutcomeUnknownError,
+                AIExecutionInProgressError,
+            ) as exc:
+                diagnostic = self._coordinator_failure_diagnostic(exc)
+                logger.error(
+                    "Webhook review job %s failed: %s",
+                    job.delivery_id,
+                    diagnostic,
+                )
+
+                stop_event.set()
+                await heartbeat_task
+
+                if not lease_lost_event.is_set():
+                    try:
+                        terminal_attempt_limit = (
+                            job.attempts
+                            if isinstance(
+                                exc,
+                                (
+                                    AIExecutionPermanentFailureError,
+                                    AIExecutionOutcomeUnknownError,
+                                ),
+                            )
+                            else self._max_attempts
+                        )
+                        # Exhaustion may fail this webhook delivery while an
+                        # in-progress AI operation remains valid and unchanged.
+                        await asyncio.to_thread(
+                            self._queue.fail_job,
+                            job.delivery_id,
+                            attempt=job.attempts,
+                            error=diagnostic,
+                            retry_delay_seconds=self._retry_delay_seconds,
+                            max_attempts=terminal_attempt_limit,
+                        )
+                    except ValueError:
+                        logger.warning(
+                            "Could not mark job %s as failed because "
+                            "its lease is no longer current.",
+                            job.delivery_id,
+                        )
+
+                return True
             except Exception as exc:
                 logger.error(
                     "Webhook review job %s failed with an ordinary exception.",
@@ -211,6 +265,59 @@ class WebhookJobWorker:
             parts.append(f"request_id={safe_request_id}")
 
         return " ".join(parts)
+
+    @staticmethod
+    def _coordinator_failure_diagnostic(
+        error: AIExecutionCoordinatorError,
+    ) -> str:
+        """Build a bounded diagnostic without exposing exception messages."""
+
+        parts = [f"AI_exception={type(error).__name__}"]
+        operation_key = WebhookJobWorker._safe_diagnostic_value(
+            error.operation_key,
+            limit=100,
+        )
+        if operation_key:
+            parts.append(f"operation_key={operation_key}")
+
+        if isinstance(error, AIExecutionRetryableError):
+            parts.append("operation_state=PENDING")
+        elif isinstance(error, AIExecutionPermanentFailureError):
+            parts.append("operation_state=FAILED_PERMANENT")
+            if isinstance(error.disposition, str) and error.disposition.strip():
+                disposition = WebhookJobWorker._safe_diagnostic_value(
+                    error.disposition,
+                    limit=100,
+                )
+                if disposition:
+                    parts.append(f"disposition={disposition}")
+            if (
+                isinstance(error.safe_error, str)
+                and error.safe_error.isascii()
+                and error.safe_error.isidentifier()
+            ):
+                parts.append(f"safe_error={error.safe_error[:100]}")
+        elif isinstance(error, AIExecutionOutcomeUnknownError):
+            parts.append("operation_state=OUTCOME_UNKNOWN")
+        elif isinstance(error, AIExecutionInProgressError):
+            parts.append("operation_state=CLAIMED")
+            parts.append("retry_policy=bounded")
+            parts.append(
+                "note=webhook_budget_exhaustion_does_not_change_ai_operation_state"
+            )
+
+        return " ".join(parts)
+
+    @staticmethod
+    def _safe_diagnostic_value(value: str, *, limit: int) -> str:
+        """Restrict operational identifiers to bounded printable ASCII."""
+
+        return "".join(
+            character
+            if character.isascii() and (character.isalnum() or character in "._:-")
+            else "_"
+            for character in value.strip()
+        )[:limit]
 
     async def _maintain_lease(
         self,
