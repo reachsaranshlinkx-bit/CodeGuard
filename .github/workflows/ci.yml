@@ -66,7 +66,8 @@ jobs:
         run: uv run pytest -v
 
       # Docker validation
-      - name: Create CI-only environment file
+      
+      - name: Create CI-only environment files
         working-directory: .
         run: |
           cat > backend/.env <<'EOF'
@@ -77,6 +78,13 @@ jobs:
           CODEGUARD_WEBHOOK_WORKER_ENABLED=false
           CODEGUARD_WEBHOOK_WORKER_POLL_INTERVAL_SECONDS=1
           EOF
+
+          cat > backend/.env.postgres <<'EOF'
+          POSTGRES_DB=codeguard
+          POSTGRES_USER=codeguard_app
+          POSTGRES_PASSWORD=ci-dummy-postgres-password-not-used
+          EOF
+
 
       - name: Validate Docker Compose
         working-directory: .
@@ -103,4 +111,4 @@ jobs:
         working-directory: .
         run: |
           docker compose down --volumes --remove-orphans
-          rm -f backend/.env
+          rm -f backend/.env backend/.env.postgres
