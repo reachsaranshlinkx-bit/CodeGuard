@@ -17,6 +17,7 @@ on:
       - "backend/**"
       - "docker-compose.yml"
       - ".github/workflows/ci.yml"
+      - "docs/**"
 
   workflow_dispatch:
 
