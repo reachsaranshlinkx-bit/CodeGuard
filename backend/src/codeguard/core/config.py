@@ -36,6 +36,7 @@ class Settings(BaseSettings):
 
     github_token: SecretStr | None = None
     api_key: SecretStr | None = None
+    database_url: SecretStr | None = None
     openai_api_key: SecretStr | None = None
     openai_model: str | None = None
     openai_request_timeout_seconds: float = 30.0
@@ -54,6 +55,32 @@ class Settings(BaseSettings):
         case_sensitive=False,
         extra="ignore",
     )
+
+    @field_validator("database_url")
+    @classmethod
+    def validate_database_url(
+        cls,
+        value: SecretStr | None,
+    ) -> SecretStr | None:
+        """Validate the PostgreSQL connection URL without exposing credentials."""
+
+        if value is None:
+            return None
+
+        normalized = value.get_secret_value().strip()
+
+        if not normalized:
+            raise ValueError("CODEGUARD_DATABASE_URL cannot be empty.")
+
+        if not normalized.startswith("postgresql+psycopg://"):
+            raise ValueError(
+                "CODEGUARD_DATABASE_URL must use the postgresql+psycopg driver."
+            )
+
+        if "\r" in normalized or "\n" in normalized:
+            raise ValueError("CODEGUARD_DATABASE_URL contains invalid characters.")
+
+        return SecretStr(normalized)
 
     @field_validator(
         "openai_request_timeout_seconds",
