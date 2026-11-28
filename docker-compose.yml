@@ -9,6 +9,7 @@ services:
 
     env_file:
       - ./backend/.env
+
     environment:
       CODEGUARD_WEBHOOK_DATABASE_PATH: /data/webhook_deliveries.sqlite3
 
@@ -19,7 +20,6 @@ services:
       - "8000:8000"
 
     init: true
-
     restart: unless-stopped
 
     security_opt:
@@ -36,5 +36,35 @@ services:
       retries: 3
       start_period: 10s
 
+  postgres:
+    image: postgres:16-alpine
+
+    container_name: codeguard-postgres
+
+    env_file:
+      - ./backend/.env.postgres
+
+    ports:
+      - "127.0.0.1:5434:5432"
+
+    volumes:
+      - codeguard-postgres-data:/var/lib/postgresql/data
+
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - pg_isready -U "$${POSTGRES_USER}" -d "$${POSTGRES_DB}"
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+    init: true
+    restart: unless-stopped
+
+    security_opt:
+      - no-new-privileges:true
+
 volumes:
   codeguard-data:
+  codeguard-postgres-data:

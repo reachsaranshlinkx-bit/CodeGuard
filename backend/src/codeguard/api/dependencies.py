@@ -3,6 +3,7 @@ from collections.abc import AsyncIterator
 from typing import Annotated
 
 from fastapi import Depends, Header, HTTPException, Request, status
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from codeguard.context.repository_context_builder import (
     RepositoryContextBuilder,
@@ -15,6 +16,24 @@ from codeguard.services.webhook_review_processor import (
 )
 from codeguard.webhooks.delivery_store import WebhookDeliveryStore
 from codeguard.webhooks.job_queue import WebhookJobQueue
+
+
+async def get_db_session(request: Request) -> AsyncIterator[AsyncSession]:
+    """Provide a request-scoped async session from the application lifespan."""
+
+    session_factory: async_sessionmaker[AsyncSession] | None = getattr(
+        request.app.state,
+        "database_session_factory",
+        None,
+    )
+    if session_factory is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Database is unavailable.",
+        )
+
+    async with session_factory() as session:
+        yield session
 
 
 async def get_github_client(

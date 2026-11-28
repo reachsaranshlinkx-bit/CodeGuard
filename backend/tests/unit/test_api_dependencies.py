@@ -1,10 +1,12 @@
+from __future__ import annotations
+
 import pytest
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException, status
 from pydantic import SecretStr
 from starlette.requests import Request
 
 import codeguard.api.dependencies as dependencies
-from codeguard.api.dependencies import get_webhook_job_queue
+from codeguard.api.dependencies import get_db_session, get_webhook_job_queue
 from codeguard.context.repository_context_builder import (
     RepositoryContextBuilder,
 )
@@ -21,6 +23,17 @@ class FakeGitHubClient:
         self.closed = False
 
     async def aclose(self) -> None:
+        self.closed = True
+
+
+class FakeAsyncSession:
+    def __init__(self) -> None:
+        self.closed = False
+
+    async def __aenter__(self) -> FakeAsyncSession:
+        return self
+
+    async def __aexit__(self, *args: object) -> None:
         self.closed = True
 
 
@@ -93,6 +106,34 @@ async def test_github_client_dependency_supports_missing_token(
     await generator.aclose()
 
     assert client.closed is True
+
+
+async def test_db_session_dependency_yields_and_closes_session() -> None:
+    app = FastAPI()
+    session = FakeAsyncSession()
+    app.state.database_session_factory = lambda: session
+    request = Request({"type": "http", "app": app})
+    session_dependency = get_db_session(request)
+
+    yielded_session = await anext(session_dependency)
+
+    assert yielded_session is session
+    assert session.closed is False
+    await session_dependency.aclose()
+    assert session.closed is True
+
+
+async def test_db_session_dependency_returns_503_when_database_unavailable() -> None:
+    app = FastAPI()
+    app.state.database_session_factory = None
+    request = Request({"type": "http", "app": app})
+    session_dependency = get_db_session(request)
+
+    with pytest.raises(HTTPException) as exc_info:
+        await anext(session_dependency)
+
+    assert exc_info.value.status_code == status.HTTP_503_SERVICE_UNAVAILABLE
+    assert exc_info.value.detail == "Database is unavailable."
 
 
 def test_analyzer_dependency_uses_provided_github_client() -> None:

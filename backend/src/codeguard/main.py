@@ -4,6 +4,8 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncEngine
 
 from codeguard.ai.execution_coordinator import AIExecutionCoordinator
 from codeguard.ai.factory import (
@@ -19,6 +21,7 @@ from codeguard.context.repository_context_builder import (
 )
 from codeguard.core.config import Settings, get_settings
 from codeguard.core.logging_config import configure_logging
+from codeguard.db.database import create_database_engine, create_session_factory
 from codeguard.github.client import GitHubClient
 from codeguard.services.pull_request_analyzer import PullRequestAnalyzer
 from codeguard.services.webhook_job_worker import WebhookJobWorker
@@ -66,25 +69,46 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-        """Manage background worker and GitHub client lifecycle."""
+        """Manage database, background worker, and GitHub client lifecycles."""
 
-        if not app_settings.webhook_worker_enabled:
-            logger.info("webhook_worker_disabled")
-            yield
-            return
+        app.state.database_engine = None
+        app.state.database_session_factory = None
+        app.state.webhook_worker = None
 
-        token = (
-            app_settings.github_token.get_secret_value()
-            if app_settings.github_token is not None
-            else None
-        )
-
-        github_client = GitHubClient(token=token)
+        database_engine: AsyncEngine | None = None
+        github_client: GitHubClient | None = None
         worker_task: asyncio.Task[None] | None = None
-        stop_event = asyncio.Event()
+        stop_event: asyncio.Event | None = None
         provider_selection: AIReviewProviderSelection | None = None
 
         try:
+            if app_settings.database_url is not None:
+                try:
+                    database_engine = create_database_engine(
+                        app_settings.database_url,
+                    )
+                    app.state.database_engine = database_engine
+                    session_factory = create_session_factory(database_engine)
+                    app.state.database_session_factory = session_factory
+                    async with database_engine.connect() as connection:
+                        await connection.execute(text("SELECT 1"))
+                except Exception:
+                    logger.error("database_initialization_failed")
+                    raise RuntimeError("Database initialization failed.") from None
+
+            if not app_settings.webhook_worker_enabled:
+                logger.info("webhook_worker_disabled")
+                yield
+                return
+
+            token = (
+                app_settings.github_token.get_secret_value()
+                if app_settings.github_token is not None
+                else None
+            )
+            github_client = GitHubClient(token=token)
+            stop_event = asyncio.Event()
+
             provider_selection = create_ai_review_provider_selection(app_settings)
             ai_execution_coordinator = (
                 AIExecutionCoordinator(
@@ -130,23 +154,35 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             )
 
             logger.info("webhook_worker_started")
-
-            try:
-                yield
-            finally:
-                stop_event.set()
-
-                if worker_task is not None:
-                    await worker_task
-
-                logger.info("webhook_worker_stopped")
+            yield
 
         finally:
             try:
-                if provider_selection is not None:
-                    await provider_selection.aclose()
+                if stop_event is not None:
+                    stop_event.set()
+                if worker_task is not None:
+                    await worker_task
+                    logger.info("webhook_worker_stopped")
             finally:
-                await github_client.aclose()
+                try:
+                    if provider_selection is not None:
+                        await provider_selection.aclose()
+                finally:
+                    try:
+                        if github_client is not None:
+                            await github_client.aclose()
+                    finally:
+                        app.state.webhook_worker = None
+                        app.state.database_session_factory = None
+                        app.state.database_engine = None
+                        if database_engine is not None:
+                            try:
+                                await database_engine.dispose()
+                            except Exception:
+                                logger.error("database_engine_disposal_failed")
+                                raise RuntimeError(
+                                    "Database shutdown failed."
+                                ) from None
 
     app = FastAPI(
         title=app_settings.app_name,
@@ -171,6 +207,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     )
 
     app.state.webhook_worker = None
+    app.state.database_engine = None
+    app.state.database_session_factory = None
 
     app.dependency_overrides[get_settings] = lambda: app_settings
 
