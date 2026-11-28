@@ -6,6 +6,7 @@ from sqlalchemy import pool
 from sqlalchemy.engine import Connection
 from sqlalchemy.ext.asyncio import create_async_engine
 
+import codeguard.db.models  # noqa: F401
 from codeguard.core.config import Settings
 from codeguard.db.base import Base
 
